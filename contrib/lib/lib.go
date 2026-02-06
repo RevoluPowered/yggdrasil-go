@@ -1,0 +1,691 @@
+package main
+
+/*
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Log callback. level: 0=trace, 1=debug, 2=info, 3=warn, 4=error
+typedef void (*ygg_log_callback)(const char* msg, int level);
+
+static void call_log_cb(ygg_log_callback cb, const char* msg, int level) {
+	if (cb) cb(msg, level);
+}
+*/
+import "C"
+
+import (
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/url"
+	"regexp"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+
+	iwt "github.com/Arceliar/ironwood/types"
+	"github.com/gologme/log"
+
+	"github.com/yggdrasil-network/yggdrasil-go/src/address"
+	"github.com/yggdrasil-network/yggdrasil-go/src/config"
+	"github.com/yggdrasil-network/yggdrasil-go/src/core"
+	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
+	"github.com/yggdrasil-network/yggdrasil-go/src/multicast"
+	"github.com/yggdrasil-network/yggdrasil-go/src/version"
+)
+
+// ---------------------------------------------------------------------------
+// Handle map
+// ---------------------------------------------------------------------------
+
+type recvPacket struct {
+	data []byte
+	from net.Addr
+}
+
+type yggNode struct {
+	core       *core.Core
+	iprwc      *ipv6rwc.ReadWriteCloser
+	iprwcOnce  sync.Once
+	bgOnce     sync.Once
+	config     *config.NodeConfig
+	multicast  *multicast.Multicast
+	logger     *log.Logger
+	recvCh     chan recvPacket // background reader feeds this (lazy, started by ygg_recv_from)
+	ioModeLock sync.Mutex     // protects first-use choice between ipv6rwc vs core I/O
+	ioMode     int            // 0=undecided, 1=ipv6rwc (ygg_send/ygg_recv), 2=core (ygg_send_to/ygg_recv_from)
+}
+
+var (
+	handleMu  sync.RWMutex
+	handleMap = make(map[C.int]*yggNode)
+	nextID    int32
+)
+
+func newHandle(n *yggNode) C.int {
+	h := C.int(atomic.AddInt32(&nextID, 1))
+	handleMu.Lock()
+	handleMap[h] = n
+	handleMu.Unlock()
+	return h
+}
+
+func getNode(h C.int) *yggNode {
+	handleMu.RLock()
+	n := handleMap[h]
+	handleMu.RUnlock()
+	return n
+}
+
+func removeHandle(h C.int) {
+	handleMu.Lock()
+	delete(handleMap, h)
+	handleMu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Error state
+// ---------------------------------------------------------------------------
+
+var (
+	lastErrMu  sync.Mutex
+	lastErrStr *C.char
+)
+
+func setLastError(err error) {
+	lastErrMu.Lock()
+	if lastErrStr != nil {
+		C.free(unsafe.Pointer(lastErrStr))
+		lastErrStr = nil
+	}
+	if err != nil {
+		lastErrStr = C.CString(err.Error())
+	}
+	lastErrMu.Unlock()
+}
+
+//export ygg_last_error
+func ygg_last_error() *C.char {
+	lastErrMu.Lock()
+	s := lastErrStr
+	lastErrMu.Unlock()
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// Logger adapter
+// ---------------------------------------------------------------------------
+
+type callbackWriter struct {
+	cb    C.ygg_log_callback
+	level C.int
+}
+
+func (w *callbackWriter) Write(p []byte) (int, error) {
+	if w.cb == nil {
+		return len(p), nil
+	}
+	cstr := C.CString(string(p))
+	C.call_log_cb(w.cb, cstr, w.level)
+	C.free(unsafe.Pointer(cstr))
+	return len(p), nil
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+//export ygg_start
+func ygg_start(configJSON *C.char, logCb C.ygg_log_callback) C.int {
+	node := &yggNode{}
+
+	// Logger
+	var logger *log.Logger
+	if logCb != nil {
+		logger = log.New(&callbackWriter{cb: logCb, level: 2}, "", 0)
+	} else {
+		logger = log.New(&callbackWriter{}, "", 0)
+	}
+	logger.EnableLevel("error")
+	logger.EnableLevel("warn")
+	logger.EnableLevel("info")
+	node.logger = logger
+
+	// Config
+	node.config = config.GenerateConfig()
+	if err := node.config.UnmarshalHJSON([]byte(C.GoString(configJSON))); err != nil {
+		setLastError(err)
+		return -1
+	}
+	node.config.IfName = "none"
+
+	// Core options — mirrors contrib/mobile/mobile.go
+	iprange := net.IPNet{
+		IP:   net.ParseIP("200::"),
+		Mask: net.CIDRMask(7, 128),
+	}
+	options := []core.SetupOption{
+		core.PeerFilter(func(ip net.IP) bool {
+			return !iprange.Contains(ip)
+		}),
+	}
+	for _, peer := range node.config.Peers {
+		options = append(options, core.Peer{URI: peer})
+	}
+	for intf, peers := range node.config.InterfacePeers {
+		for _, peer := range peers {
+			options = append(options, core.Peer{URI: peer, SourceInterface: intf})
+		}
+	}
+	for _, allowed := range node.config.AllowedPublicKeys {
+		k, err := hex.DecodeString(allowed)
+		if err != nil {
+			continue
+		}
+		options = append(options, core.AllowedPublicKey(k))
+	}
+	for _, lAddr := range node.config.Listen {
+		options = append(options, core.ListenAddress(lAddr))
+	}
+
+	var err error
+	node.core, err = core.New(node.config.Certificate, logger, options...)
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+
+	// Multicast
+	if len(node.config.MulticastInterfaces) > 0 {
+		var mcastOpts []multicast.SetupOption
+		for _, intf := range node.config.MulticastInterfaces {
+			mcastOpts = append(mcastOpts, multicast.MulticastInterface{
+				Regex:    regexp.MustCompile(intf.Regex),
+				Beacon:   intf.Beacon,
+				Listen:   intf.Listen,
+				Port:     intf.Port,
+				Priority: uint8(intf.Priority),
+				Password: intf.Password,
+			})
+		}
+		node.multicast, _ = multicast.New(node.core, node.logger, mcastOpts...)
+	}
+
+	// I/O mode is chosen lazily on first use:
+	//   - ygg_send/ygg_recv use ipv6rwc (address-based, initialized by ensureIPRWC)
+	//   - ygg_send_to/ygg_recv_from use core directly (key-based, bg reader started by ensureBgReader)
+	// The two modes are mutually exclusive: ipv6rwc and the background reader
+	// both call core.ReadFrom, so running both causes packets to be randomly
+	// consumed by the wrong reader.
+	node.recvCh = make(chan recvPacket, 256)
+
+	setLastError(nil)
+	return newHandle(node)
+}
+
+//export ygg_stop
+func ygg_stop(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	if node.multicast != nil {
+		_ = node.multicast.Stop()
+	}
+	node.core.Stop()
+	removeHandle(handle)
+	setLastError(nil)
+	return 0
+}
+
+//export ygg_generate_config
+func ygg_generate_config() *C.char {
+	nc := config.GenerateConfig()
+	nc.IfName = "none"
+	j, err := json.Marshal(nc)
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	return C.CString(string(j))
+}
+
+// ---------------------------------------------------------------------------
+// Packet I/O (IPv6-address-based, uses ipv6rwc layer)
+// ---------------------------------------------------------------------------
+
+// ensureIPRWC lazily initializes the ipv6rwc layer for ygg_send/ygg_recv.
+// Must not be used after ensureBgReader has been called (the two modes are
+// mutually exclusive because both call core.ReadFrom).
+func ensureIPRWC(node *yggNode) {
+	node.iprwcOnce.Do(func() {
+		node.ioModeLock.Lock()
+		defer node.ioModeLock.Unlock()
+		if node.ioMode == 2 {
+			panic("libyggdrasil: cannot use ygg_send/ygg_recv after ygg_recv_from")
+		}
+		node.ioMode = 1
+
+		mtu := node.config.IfMTU
+		node.iprwc = ipv6rwc.NewReadWriteCloser(node.core)
+		if node.iprwc.MaxMTU() < mtu {
+			mtu = node.iprwc.MaxMTU()
+		}
+		node.iprwc.SetMTU(mtu)
+	})
+}
+
+// ensureBgReader lazily starts the background reader goroutine for
+// ygg_recv_from / ygg_recv_from_timeout (key-based I/O).
+// Must not be used after ensureIPRWC has been called.
+func ensureBgReader(node *yggNode) {
+	node.bgOnce.Do(func() {
+		node.ioModeLock.Lock()
+		defer node.ioModeLock.Unlock()
+		if node.ioMode == 1 {
+			panic("libyggdrasil: cannot use ygg_recv_from after ygg_send/ygg_recv")
+		}
+		node.ioMode = 2
+
+		go func() {
+			buf := make([]byte, node.core.MTU())
+			for {
+				n, from, err := node.core.ReadFrom(buf)
+				if err != nil {
+					close(node.recvCh)
+					return
+				}
+				if n == 0 {
+					continue
+				}
+				pkt := make([]byte, n)
+				copy(pkt, buf[:n])
+				node.recvCh <- recvPacket{data: pkt, from: from}
+			}
+		}()
+	})
+}
+
+//export ygg_send
+func ygg_send(handle C.int, data unsafe.Pointer, length C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	ensureIPRWC(node)
+	n, err := node.iprwc.Write(C.GoBytes(data, length))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	return C.int(n)
+}
+
+//export ygg_recv
+func ygg_recv(handle C.int, buf unsafe.Pointer, bufLen C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	ensureIPRWC(node)
+	tmp := make([]byte, int(bufLen))
+	n, err := node.iprwc.Read(tmp)
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	C.memcpy(buf, unsafe.Pointer(&tmp[0]), C.size_t(n))
+	return C.int(n)
+}
+
+// ---------------------------------------------------------------------------
+// Packet I/O (key-based, bypasses IPv6 address lookup)
+// ---------------------------------------------------------------------------
+
+//export ygg_send_to
+func ygg_send_to(handle C.int, peerKeyHex *C.char, data unsafe.Pointer, length C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	// Ensure bg reader is running so core.ReadFrom processes session
+	// init/ack messages needed for Ironwood session establishment.
+	ensureBgReader(node)
+	keyBytes, err := hex.DecodeString(C.GoString(peerKeyHex))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	n, err := node.core.WriteTo(C.GoBytes(data, length), iwt.Addr(keyBytes))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	return C.int(n)
+}
+
+//export ygg_recv_from
+func ygg_recv_from(handle C.int, buf unsafe.Pointer, bufLen C.int, peerKeyHexOut *C.char, peerKeyHexOutLen C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	ensureBgReader(node)
+	pkt, ok := <-node.recvCh
+	if !ok {
+		setLastError(fmt.Errorf("node stopped"))
+		return -1
+	}
+	n := len(pkt.data)
+	if n > int(bufLen) {
+		n = int(bufLen)
+	}
+	C.memcpy(buf, unsafe.Pointer(&pkt.data[0]), C.size_t(n))
+	// Write sender's public key hex into output buffer
+	if peerKeyHexOut != nil && peerKeyHexOutLen > 0 {
+		keyHex := hex.EncodeToString([]byte(pkt.from.(iwt.Addr)))
+		outSlice := (*[1 << 30]byte)(unsafe.Pointer(peerKeyHexOut))[:int(peerKeyHexOutLen):int(peerKeyHexOutLen)]
+		copied := copy(outSlice, keyHex)
+		if copied < int(peerKeyHexOutLen) {
+			outSlice[copied] = 0
+		} else {
+			outSlice[int(peerKeyHexOutLen)-1] = 0
+		}
+	}
+	return C.int(n)
+}
+
+//export ygg_recv_from_timeout
+func ygg_recv_from_timeout(handle C.int, buf unsafe.Pointer, bufLen C.int, peerKeyHexOut *C.char, peerKeyHexOutLen C.int, timeoutMs C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	ensureBgReader(node)
+	var pkt recvPacket
+	var ok bool
+	if timeoutMs < 0 {
+		// Negative timeout = block forever (same as ygg_recv_from)
+		pkt, ok = <-node.recvCh
+	} else {
+		select {
+		case pkt, ok = <-node.recvCh:
+		case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
+			setLastError(fmt.Errorf("recv timeout"))
+			return -1
+		}
+	}
+	if !ok {
+		setLastError(fmt.Errorf("node stopped"))
+		return -1
+	}
+	n := len(pkt.data)
+	if n > int(bufLen) {
+		n = int(bufLen)
+	}
+	C.memcpy(buf, unsafe.Pointer(&pkt.data[0]), C.size_t(n))
+	if peerKeyHexOut != nil && peerKeyHexOutLen > 0 {
+		keyHex := hex.EncodeToString([]byte(pkt.from.(iwt.Addr)))
+		outSlice := (*[1 << 30]byte)(unsafe.Pointer(peerKeyHexOut))[:int(peerKeyHexOutLen):int(peerKeyHexOutLen)]
+		copied := copy(outSlice, keyHex)
+		if copied < int(peerKeyHexOutLen) {
+			outSlice[copied] = 0
+		} else {
+			outSlice[int(peerKeyHexOutLen)-1] = 0
+		}
+	}
+	return C.int(n)
+}
+
+// ---------------------------------------------------------------------------
+// Peer management
+// ---------------------------------------------------------------------------
+
+func parseSintf(sintf *C.char) string {
+	if sintf == nil {
+		return ""
+	}
+	return C.GoString(sintf)
+}
+
+//export ygg_add_peer
+func ygg_add_peer(handle C.int, uri *C.char, sintf *C.char) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	u, err := url.Parse(C.GoString(uri))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	if err := node.core.AddPeer(u, parseSintf(sintf)); err != nil {
+		setLastError(err)
+		return -1
+	}
+	setLastError(nil)
+	return 0
+}
+
+//export ygg_remove_peer
+func ygg_remove_peer(handle C.int, uri *C.char, sintf *C.char) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	u, err := url.Parse(C.GoString(uri))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	if err := node.core.RemovePeer(u, parseSintf(sintf)); err != nil {
+		setLastError(err)
+		return -1
+	}
+	setLastError(nil)
+	return 0
+}
+
+//export ygg_retry_peers_now
+func ygg_retry_peers_now(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	node.core.RetryPeersNow()
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Node information
+// ---------------------------------------------------------------------------
+
+//export ygg_get_address
+func ygg_get_address(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	return C.CString(node.core.Address().String())
+}
+
+//export ygg_get_subnet
+func ygg_get_subnet(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	sn := node.core.Subnet()
+	return C.CString(sn.String())
+}
+
+//export ygg_get_public_key
+func ygg_get_public_key(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	return C.CString(hex.EncodeToString(node.core.PublicKey()))
+}
+
+//export ygg_get_mtu
+func ygg_get_mtu(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		return 0
+	}
+	return C.int(node.core.MTU())
+}
+
+//export ygg_get_routing_entries
+func ygg_get_routing_entries(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		return 0
+	}
+	return C.int(node.core.GetSelf().RoutingEntries)
+}
+
+//export ygg_get_version
+func ygg_get_version() *C.char {
+	return C.CString(version.BuildVersion())
+}
+
+// ---------------------------------------------------------------------------
+// Network state (JSON)
+// ---------------------------------------------------------------------------
+
+func marshalOrEmpty(v interface{}) *C.char {
+	j, err := json.Marshal(v)
+	if err != nil {
+		return C.CString("{}")
+	}
+	return C.CString(string(j))
+}
+
+//export ygg_get_self_json
+func ygg_get_self_json(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	self := node.core.GetSelf()
+	res := struct {
+		Key            string `json:"key"`
+		RoutingEntries uint64 `json:"routing_entries"`
+	}{
+		Key:            hex.EncodeToString(self.Key),
+		RoutingEntries: self.RoutingEntries,
+	}
+	return marshalOrEmpty(res)
+}
+
+//export ygg_get_peers_json
+func ygg_get_peers_json(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	peers := []struct {
+		core.PeerInfo
+		IP string
+	}{}
+	for _, v := range node.core.GetPeers() {
+		var ip string
+		if v.Key != nil {
+			a := address.AddrForKey(v.Key)
+			ip = net.IP(a[:]).String()
+		}
+		peers = append(peers, struct {
+			core.PeerInfo
+			IP string
+		}{PeerInfo: v, IP: ip})
+	}
+	return marshalOrEmpty(peers)
+}
+
+//export ygg_get_paths_json
+func ygg_get_paths_json(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	return marshalOrEmpty(node.core.GetPaths())
+}
+
+//export ygg_get_tree_json
+func ygg_get_tree_json(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	return marshalOrEmpty(node.core.GetTree())
+}
+
+//export ygg_get_sessions_json
+func ygg_get_sessions_json(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		return nil
+	}
+	return marshalOrEmpty(node.core.GetSessions())
+}
+
+// ---------------------------------------------------------------------------
+// Configuration utilities
+// ---------------------------------------------------------------------------
+
+//export ygg_config_summary
+func ygg_config_summary(configJSON *C.char) *C.char {
+	cfg := config.GenerateConfig()
+	if err := cfg.UnmarshalHJSON([]byte(C.GoString(configJSON))); err != nil {
+		setLastError(err)
+		return nil
+	}
+	pub := ed25519.PrivateKey(cfg.PrivateKey).Public().(ed25519.PublicKey)
+	addr := net.IP(address.AddrForKey(pub)[:])
+	snet := net.IPNet{
+		IP:   append(address.SubnetForKey(pub)[:], 0, 0, 0, 0, 0, 0, 0, 0),
+		Mask: net.CIDRMask(64, 128),
+	}
+	res := struct {
+		PublicKey   string `json:"public_key"`
+		IPv6Address string `json:"ipv6_address"`
+		IPv6Subnet  string `json:"ipv6_subnet"`
+	}{
+		PublicKey:   hex.EncodeToString(pub),
+		IPv6Address: addr.String(),
+		IPv6Subnet:  snet.String(),
+	}
+	return marshalOrEmpty(res)
+}
+
+// ---------------------------------------------------------------------------
+// Memory management
+// ---------------------------------------------------------------------------
+
+//export ygg_free_string
+func ygg_free_string(s *C.char) {
+	if s != nil {
+		C.free(unsafe.Pointer(s))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Required for c-shared / c-archive
+// ---------------------------------------------------------------------------
+
+func main() {}

@@ -1,0 +1,88 @@
+#!/bin/sh
+
+set -ef
+
+PKGSRC=${PKGSRC:-github.com/yggdrasil-network/yggdrasil-go/src/version}
+PKGNAME=${PKGNAME:-$(sh contrib/semver/name.sh)}
+PKGVER=${PKGVER:-$(sh contrib/semver/version.sh --bare)}
+
+LDFLAGS="-X $PKGSRC.buildName=$PKGNAME -X $PKGSRC.buildVersion=$PKGVER"
+ARGS="-v"
+BUILDMODE="c-shared"
+OUTPUT=""
+
+while getopts "stc:l:do:" option
+do
+  case "$option"
+  in
+  s) BUILDMODE="c-archive";;
+  t) TABLES=true;;
+  c) GCFLAGS="$GCFLAGS $OPTARG";;
+  l) LDFLAGS="$LDFLAGS $OPTARG";;
+  d) ARGS="$ARGS -tags debug" DEBUG=true;;
+  o) OUTPUT="$OPTARG";;
+  esac
+done
+
+if [ -z "$TABLES" ] && [ -z "$DEBUG" ]; then
+  LDFLAGS="$LDFLAGS -s -w"
+fi
+
+# Auto-detect output filename
+if [ -z "$OUTPUT" ]; then
+  case "$(uname -s)" in
+    Linux*)
+      if [ "$BUILDMODE" = "c-shared" ]; then OUTPUT="libyggdrasil.so"
+      else OUTPUT="libyggdrasil.a"; fi ;;
+    Darwin*)
+      if [ "$BUILDMODE" = "c-shared" ]; then OUTPUT="libyggdrasil.dylib"
+      else OUTPUT="libyggdrasil.a"; fi ;;
+    MINGW*|MSYS*|CYGWIN*)
+      if [ "$BUILDMODE" = "c-shared" ]; then OUTPUT="yggdrasil.dll"
+      else OUTPUT="yggdrasil.a"; fi ;;
+    *)
+      if [ "$BUILDMODE" = "c-shared" ]; then OUTPUT="libyggdrasil.so"
+      else OUTPUT="libyggdrasil.a"; fi ;;
+  esac
+fi
+
+# On macOS with c-archive, build universal (arm64+x86_64) by default
+if [ "$(uname -s)" = "Darwin" ] && [ "$BUILDMODE" = "c-archive" ]; then
+  BASENAME="${OUTPUT%.a}"
+  ARM64_OUT="${BASENAME}_arm64.a"
+  X86_64_OUT="${BASENAME}_x86_64.a"
+
+  echo "Building universal static library: $OUTPUT"
+
+  echo "  Building arm64..."
+  CGO_ENABLED=1 GOARCH=arm64 go build $ARGS \
+    -buildmode="$BUILDMODE" \
+    -o "$ARM64_OUT" \
+    -ldflags="$LDFLAGS" \
+    -gcflags="$GCFLAGS" \
+    ./contrib/lib
+
+  echo "  Building x86_64..."
+  CGO_ENABLED=1 GOARCH=amd64 go build $ARGS \
+    -buildmode="$BUILDMODE" \
+    -o "$X86_64_OUT" \
+    -ldflags="$LDFLAGS" \
+    -gcflags="$GCFLAGS" \
+    ./contrib/lib
+
+  echo "  Combining with lipo..."
+  lipo -create "$ARM64_OUT" "$X86_64_OUT" -output "$OUTPUT"
+  lipo -info "$OUTPUT"
+
+  echo "Done: $OUTPUT (universal)"
+else
+  echo "Building: $OUTPUT (mode: $BUILDMODE)"
+  CGO_ENABLED=1 go build $ARGS \
+    -buildmode="$BUILDMODE" \
+    -o "$OUTPUT" \
+    -ldflags="$LDFLAGS" \
+    -gcflags="$GCFLAGS" \
+    ./contrib/lib
+
+  echo "Done: $OUTPUT"
+fi
