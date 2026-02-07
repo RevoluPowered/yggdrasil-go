@@ -56,6 +56,7 @@ type yggNode struct {
 	multicast  *multicast.Multicast
 	logger     *log.Logger
 	recvCh     chan recvPacket // background reader feeds this (lazy, started by ygg_recv_from)
+	recvBuf    []byte         // reusable buffer for ygg_recv (single caller: recv thread)
 	ioModeLock sync.Mutex     // protects first-use choice between ipv6rwc vs core I/O
 	ioMode     int            // 0=undecided, 1=ipv6rwc (ygg_send/ygg_recv), 2=core (ygg_send_to/ygg_recv_from)
 }
@@ -335,13 +336,16 @@ func ygg_recv(handle C.int, buf unsafe.Pointer, bufLen C.int) C.int {
 		return -1
 	}
 	ensureIPRWC(node)
-	tmp := make([]byte, int(bufLen))
-	n, err := node.iprwc.Read(tmp)
+	needed := int(bufLen)
+	if len(node.recvBuf) < needed {
+		node.recvBuf = make([]byte, needed)
+	}
+	n, err := node.iprwc.Read(node.recvBuf[:needed])
 	if err != nil {
 		setLastError(err)
 		return -1
 	}
-	C.memcpy(buf, unsafe.Pointer(&tmp[0]), C.size_t(n))
+	C.memcpy(buf, unsafe.Pointer(&node.recvBuf[0]), C.size_t(n))
 	return C.int(n)
 }
 
@@ -507,6 +511,33 @@ func ygg_retry_peers_now(handle C.int) C.int {
 	}
 	node.core.RetryPeersNow()
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Listener management
+// ---------------------------------------------------------------------------
+
+//export ygg_listen
+func ygg_listen(handle C.int, uri *C.char) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	u, err := url.Parse(C.GoString(uri))
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	listener, err := node.core.Listen(u, "")
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	// Return the URI with the actual assigned address/port
+	actualURI := u.Scheme + "://" + listener.Addr().String()
+	setLastError(nil)
+	return C.CString(actualURI)
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +712,24 @@ func ygg_config_summary(configJSON *C.char) *C.char {
 func ygg_free_string(s *C.char) {
 	if s != nil {
 		C.free(unsafe.Pointer(s))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark helpers
+// ---------------------------------------------------------------------------
+
+//export ygg_noop
+func ygg_noop() {
+	// Intentionally empty. Measures bare CGo call overhead.
+}
+
+//export ygg_noop_with_data
+func ygg_noop_with_data(data unsafe.Pointer, length C.int) {
+	// Access the data to prevent the compiler from optimizing the call away.
+	// This measures CGo overhead when passing a data pointer of arbitrary size.
+	if length > 0 {
+		_ = C.GoBytes(data, length)
 	}
 }
 
