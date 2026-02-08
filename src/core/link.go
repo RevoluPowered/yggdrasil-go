@@ -694,6 +694,20 @@ func (l *links) handler(linkType linkType, options linkOptions, conn net.Conn, s
 		success()
 	}
 
+	// Register QUIC datagram support for this peer if available.
+	if lc, ok := conn.(*linkConn); ok {
+		if qs, ok := lc.Conn.(*linkQUICStream); ok {
+			qc := qs.Conn
+			if cs := qc.ConnectionState(); cs.SupportsDatagrams.Local && cs.SupportsDatagrams.Remote {
+				var peerKey keyArray
+				copy(peerKey[:], meta.publicKey)
+				l.core.registerDatagramConn(peerKey, qc)
+				defer l.core.unregisterDatagramConn(peerKey)
+				go l.core.datagramReceiver(peerKey, qc)
+			}
+		}
+	}
+
 	err = l.core.HandleConn(meta.publicKey, conn, priority)
 	switch err {
 	case io.EOF, net.ErrClosed, nil:

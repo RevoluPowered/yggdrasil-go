@@ -52,13 +52,16 @@ type yggNode struct {
 	iprwc      *ipv6rwc.ReadWriteCloser
 	iprwcOnce  sync.Once
 	bgOnce     sync.Once
+	dgBgOnce   sync.Once
 	config     *config.NodeConfig
 	multicast  *multicast.Multicast
 	logger     *log.Logger
 	recvCh     chan recvPacket // background reader feeds this (lazy, started by ygg_recv_from)
+	dgRecvCh   chan recvPacket // datagram background reader feeds this
 	recvBuf    []byte         // reusable buffer for ygg_recv (single caller: recv thread)
 	ioModeLock sync.Mutex     // protects first-use choice between ipv6rwc vs core I/O
 	ioMode     int            // 0=undecided, 1=ipv6rwc (ygg_send/ygg_recv), 2=core (ygg_send_to/ygg_recv_from)
+	knownPeers sync.Map       // tracks keys we've received pathNotify for (core I/O mode)
 }
 
 var (
@@ -174,14 +177,12 @@ func ygg_start(configJSON *C.char, logCb C.ygg_log_callback) C.int {
 			return !iprange.Contains(ip)
 		}),
 	}
-	for _, peer := range node.config.Peers {
-		options = append(options, core.Peer{URI: peer})
-	}
-	for intf, peers := range node.config.InterfacePeers {
-		for _, peer := range peers {
-			options = append(options, core.Peer{URI: peer, SourceInterface: intf})
-		}
-	}
+	// Note: Peers are NOT added as core.Peer{} setup options because that
+	// creates persistent links (linkTypePersistent) with exponential backoff.
+	// Ironwood's encrypted session init through persistent links triggers a
+	// 60-second sessionTimeout delay before data can flow. Instead, we use
+	// CallPeer after core.New, which creates ephemeral links that establish
+	// encrypted sessions immediately (~3 seconds for multi-hop chains).
 	for _, allowed := range node.config.AllowedPublicKeys {
 		k, err := hex.DecodeString(allowed)
 		if err != nil {
@@ -198,6 +199,28 @@ func ygg_start(configJSON *C.char, logCb C.ygg_log_callback) C.int {
 	if err != nil {
 		setLastError(err)
 		return -1
+	}
+
+	// Connect to configured peers using CallPeer (ephemeral links).
+	for _, peer := range node.config.Peers {
+		u, err := url.Parse(peer)
+		if err != nil {
+			continue
+		}
+		if err := node.core.CallPeer(u, ""); err != nil {
+			logger.Warnln("Failed to call peer", peer, err)
+		}
+	}
+	for intf, peers := range node.config.InterfacePeers {
+		for _, peer := range peers {
+			u, err := url.Parse(peer)
+			if err != nil {
+				continue
+			}
+			if err := node.core.CallPeer(u, intf); err != nil {
+				logger.Warnln("Failed to call peer", peer, err)
+			}
+		}
 	}
 
 	// Multicast
@@ -293,6 +316,12 @@ func ensureBgReader(node *yggNode) {
 		}
 		node.ioMode = 2
 
+		// Register path notification so we know when Ironwood discovers
+		// a route. Keys in knownPeers skip the SendLookup in ygg_send_to.
+		node.core.SetPathNotify(func(key ed25519.PublicKey) {
+			node.knownPeers.Store(string(key), struct{}{})
+		})
+
 		go func() {
 			buf := make([]byte, node.core.MTU())
 			for {
@@ -367,6 +396,13 @@ func ygg_send_to(handle C.int, peerKeyHex *C.char, data unsafe.Pointer, length C
 	if err != nil {
 		setLastError(err)
 		return -1
+	}
+	// Trigger Ironwood path discovery for destinations we haven't resolved yet.
+	// Without this, WriteTo silently drops packets to multi-hop destinations
+	// because Ironwood doesn't know the route. This replaces the SendLookup
+	// that ipv6rwc performed internally via sendKeyLookup.
+	if _, known := node.knownPeers.Load(string(keyBytes)); !known {
+		node.core.SendLookup(keyBytes)
 	}
 	n, err := node.core.WriteTo(C.GoBytes(data, length), iwt.Addr(keyBytes))
 	if err != nil {
@@ -452,6 +488,120 @@ func ygg_recv_from_timeout(handle C.int, buf unsafe.Pointer, bufLen C.int, peerK
 }
 
 // ---------------------------------------------------------------------------
+// Unreliable datagram I/O (QUIC datagrams, direct peers only)
+// ---------------------------------------------------------------------------
+
+// ensureDgBgReader lazily starts the background datagram reader goroutine.
+func ensureDgBgReader(node *yggNode) {
+	node.dgBgOnce.Do(func() {
+		node.dgRecvCh = make(chan recvPacket, 256)
+		go func() {
+			ch := node.core.ReceiveDatagrams()
+			for {
+				select {
+				case pkt, ok := <-ch:
+					if !ok {
+						close(node.dgRecvCh)
+						return
+					}
+					rp := recvPacket{
+						data: pkt.Data,
+						from: iwt.Addr(pkt.From[:]),
+					}
+					select {
+					case node.dgRecvCh <- rp:
+					default:
+						// Drop: unreliable semantics
+					}
+				}
+			}
+		}()
+	})
+}
+
+//export ygg_send_to_unreliable
+func ygg_send_to_unreliable(handle C.int, peerKeyHex *C.char, data unsafe.Pointer, length C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	keyBytes, err := hex.DecodeString(C.GoString(peerKeyHex))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	if err := node.core.SendDatagram(C.GoBytes(data, length), keyBytes); err != nil {
+		setLastError(err)
+		return -1
+	}
+	return C.int(length)
+}
+
+//export ygg_recv_from_unreliable
+func ygg_recv_from_unreliable(handle C.int, buf unsafe.Pointer, bufLen C.int, peerKeyHexOut *C.char, peerKeyHexOutLen C.int, timeoutMs C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	ensureDgBgReader(node)
+	var pkt recvPacket
+	var ok bool
+	if timeoutMs < 0 {
+		pkt, ok = <-node.dgRecvCh
+	} else if timeoutMs == 0 {
+		select {
+		case pkt, ok = <-node.dgRecvCh:
+		default:
+			return -1
+		}
+	} else {
+		select {
+		case pkt, ok = <-node.dgRecvCh:
+		case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
+			return -1
+		}
+	}
+	if !ok {
+		setLastError(fmt.Errorf("node stopped"))
+		return -1
+	}
+	n := len(pkt.data)
+	if n > int(bufLen) {
+		n = int(bufLen)
+	}
+	C.memcpy(buf, unsafe.Pointer(&pkt.data[0]), C.size_t(n))
+	if peerKeyHexOut != nil && peerKeyHexOutLen > 0 {
+		keyHex := hex.EncodeToString([]byte(pkt.from.(iwt.Addr)))
+		outSlice := (*[1 << 30]byte)(unsafe.Pointer(peerKeyHexOut))[:int(peerKeyHexOutLen):int(peerKeyHexOutLen)]
+		copied := copy(outSlice, keyHex)
+		if copied < int(peerKeyHexOutLen) {
+			outSlice[copied] = 0
+		} else {
+			outSlice[int(peerKeyHexOutLen)-1] = 0
+		}
+	}
+	return C.int(n)
+}
+
+//export ygg_has_datagram_support
+func ygg_has_datagram_support(handle C.int, peerKeyHex *C.char) C.int {
+	node := getNode(handle)
+	if node == nil {
+		return 0
+	}
+	keyBytes, err := hex.DecodeString(C.GoString(peerKeyHex))
+	if err != nil {
+		return 0
+	}
+	if node.core.HasDatagramSupport(keyBytes) {
+		return 1
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
 // Peer management
 // ---------------------------------------------------------------------------
 
@@ -474,7 +624,7 @@ func ygg_add_peer(handle C.int, uri *C.char, sintf *C.char) C.int {
 		setLastError(err)
 		return -1
 	}
-	if err := node.core.AddPeer(u, parseSintf(sintf)); err != nil {
+	if err := node.core.CallPeer(u, parseSintf(sintf)); err != nil {
 		setLastError(err)
 		return -1
 	}
@@ -572,6 +722,44 @@ func ygg_get_public_key(handle C.int) *C.char {
 	return C.CString(hex.EncodeToString(node.core.PublicKey()))
 }
 
+// ygg_resolve_address looks up the public key hex for a given yggdrasil
+// IPv6 address by searching the routing table (tree + peers).
+// Returns nil if not found. Caller must free with ygg_free_string.
+//
+//export ygg_resolve_address
+func ygg_resolve_address(handle C.int, ipv6Addr *C.char) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	target := net.ParseIP(C.GoString(ipv6Addr))
+	if target == nil {
+		setLastError(fmt.Errorf("invalid IPv6 address"))
+		return nil
+	}
+	// Search tree entries
+	for _, t := range node.core.GetTree() {
+		if t.Key != nil {
+			a := address.AddrForKey(t.Key)
+			if net.IP(a[:]).Equal(target) {
+				return C.CString(hex.EncodeToString(t.Key))
+			}
+		}
+	}
+	// Search peers
+	for _, p := range node.core.GetPeers() {
+		if p.Key != nil {
+			a := address.AddrForKey(p.Key)
+			if net.IP(a[:]).Equal(target) {
+				return C.CString(hex.EncodeToString(p.Key))
+			}
+		}
+	}
+	setLastError(fmt.Errorf("address not found in routing table"))
+	return nil
+}
+
 //export ygg_get_mtu
 func ygg_get_mtu(handle C.int) C.int {
 	node := getNode(handle)
@@ -632,18 +820,22 @@ func ygg_get_peers_json(handle C.int) *C.char {
 	}
 	peers := []struct {
 		core.PeerInfo
-		IP string
+		IP     string
+		KeyHex string
 	}{}
 	for _, v := range node.core.GetPeers() {
 		var ip string
+		var keyHex string
 		if v.Key != nil {
 			a := address.AddrForKey(v.Key)
 			ip = net.IP(a[:]).String()
+			keyHex = hex.EncodeToString(v.Key)
 		}
 		peers = append(peers, struct {
 			core.PeerInfo
-			IP string
-		}{PeerInfo: v, IP: ip})
+			IP     string
+			KeyHex string
+		}{PeerInfo: v, IP: ip, KeyHex: keyHex})
 	}
 	return marshalOrEmpty(peers)
 }

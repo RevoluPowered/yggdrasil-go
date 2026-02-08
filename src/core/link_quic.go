@@ -45,6 +45,7 @@ func (l *links) newLinkQUIC() *linkQUIC {
 			MaxIdleTimeout:  time.Minute,
 			KeepAlivePeriod: time.Second * 20,
 			TokenStore:      quic.NewLRUTokenStore(255, 255),
+			EnableDatagrams: true,
 		},
 	}
 	return lt

@@ -4,16 +4,19 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
+	"sync"
 
 	iwe "github.com/Arceliar/ironwood/encrypted"
 	iwn "github.com/Arceliar/ironwood/network"
 	iwt "github.com/Arceliar/ironwood/types"
 	"github.com/Arceliar/phony"
 	"github.com/gologme/log"
+	"github.com/quic-go/quic-go"
 
 	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 	"github.com/yggdrasil-network/yggdrasil-go/src/version"
@@ -44,7 +47,23 @@ type Core struct {
 		_allowedPublicKeys map[[32]byte]struct{}      // configurable after startup
 	}
 	pathNotify func(ed25519.PublicKey)
+	dgram struct {
+		sync.RWMutex
+		conns   map[keyArray]*quic.Conn
+		frags   map[keyArray]*dgFragmenter
+		reasm   *dgReassembler
+		recvCh  chan DatagramPacket
+	}
 }
+
+// DatagramPacket is an unreliable datagram received from a direct QUIC peer.
+type DatagramPacket struct {
+	Data []byte
+	From keyArray
+}
+
+// ErrDatagramNoPeer is returned when the target peer has no datagram-capable connection.
+var ErrDatagramNoPeer = errors.New("peer not connected via QUIC datagrams")
 
 func New(cert *tls.Certificate, logger Logger, opts ...SetupOption) (*Core, error) {
 	c := &Core{
@@ -103,6 +122,10 @@ func New(cert *tls.Certificate, logger Logger, opts ...SetupOption) (*Core, erro
 		return nil, fmt.Errorf("error creating encryption: %w", err)
 	}
 	c.proto.init(c)
+	c.dgram.conns = make(map[keyArray]*quic.Conn)
+	c.dgram.frags = make(map[keyArray]*dgFragmenter)
+	c.dgram.reasm = newDgReassembler()
+	c.dgram.recvCh = make(chan DatagramPacket, 256)
 	if err := c.links.init(c); err != nil {
 		return nil, fmt.Errorf("error initialising links: %w", err)
 	}
@@ -229,6 +252,84 @@ func (c *Core) SetPathNotify(notify func(ed25519.PublicKey)) {
 	c.Act(nil, func() {
 		c.pathNotify = notify
 	})
+}
+
+func (c *Core) registerDatagramConn(peerKey keyArray, conn *quic.Conn) {
+	c.dgram.Lock()
+	c.dgram.conns[peerKey] = conn
+	c.dgram.frags[peerKey] = &dgFragmenter{}
+	c.dgram.Unlock()
+}
+
+func (c *Core) unregisterDatagramConn(peerKey keyArray) {
+	c.dgram.Lock()
+	delete(c.dgram.conns, peerKey)
+	delete(c.dgram.frags, peerKey)
+	c.dgram.Unlock()
+}
+
+func (c *Core) datagramReceiver(peerKey keyArray, conn *quic.Conn) {
+	for {
+		wire, err := conn.ReceiveDatagram(c.ctx)
+		if err != nil {
+			return
+		}
+		data := c.dgram.reasm.process(peerKey, wire)
+		if data == nil {
+			continue // Incomplete fragment or malformed
+		}
+		pkt := DatagramPacket{
+			Data: data,
+			From: peerKey,
+		}
+		select {
+		case c.dgram.recvCh <- pkt:
+		case <-c.ctx.Done():
+			return
+		default:
+			// Channel full, drop (unreliable semantics)
+		}
+	}
+}
+
+// SendDatagram sends data to a directly-connected peer via QUIC datagram (unreliable).
+// Payloads larger than the QUIC datagram MTU are automatically fragmented.
+func (c *Core) SendDatagram(data []byte, peerKey ed25519.PublicKey) error {
+	var key keyArray
+	copy(key[:], peerKey)
+	c.dgram.RLock()
+	conn, ok := c.dgram.conns[key]
+	frag := c.dgram.frags[key]
+	c.dgram.RUnlock()
+	if !ok {
+		return ErrDatagramNoPeer
+	}
+	maxSize := int(conn.ConnectionState().MaxDatagramFrameSize)
+	if maxSize <= 0 {
+		return ErrDatagramNoPeer
+	}
+	chunks := frag.fragment(data, maxSize)
+	for _, chunk := range chunks {
+		if err := conn.SendDatagram(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReceiveDatagrams returns the channel for incoming datagrams from direct QUIC peers.
+func (c *Core) ReceiveDatagrams() <-chan DatagramPacket {
+	return c.dgram.recvCh
+}
+
+// HasDatagramSupport returns true if the peer supports QUIC datagrams.
+func (c *Core) HasDatagramSupport(peerKey ed25519.PublicKey) bool {
+	var key keyArray
+	copy(key[:], peerKey)
+	c.dgram.RLock()
+	_, ok := c.dgram.conns[key]
+	c.dgram.RUnlock()
+	return ok
 }
 
 type Logger interface {
