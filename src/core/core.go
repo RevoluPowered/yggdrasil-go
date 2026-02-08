@@ -179,6 +179,7 @@ func (c *Core) Stop() {
 // This function is unsafe and should only be ran by the core actor.
 func (c *Core) _close() error {
 	c.cancel()
+	c.dgram.reasm.stop()
 	c.links.shutdown()
 	err := c.Close()
 	return err
@@ -293,7 +294,8 @@ func (c *Core) datagramReceiver(peerKey keyArray, conn *quic.Conn) {
 }
 
 // SendDatagram sends data to a directly-connected peer via QUIC datagram (unreliable).
-// Payloads larger than the QUIC datagram MTU are automatically fragmented.
+// Payloads larger than maxSafeDatagramSize are automatically fragmented.
+// Max payload: 255 fragments * ~1095 bytes/fragment ≈ 279 KB.
 func (c *Core) SendDatagram(data []byte, peerKey ed25519.PublicKey) error {
 	var key keyArray
 	copy(key[:], peerKey)
@@ -304,11 +306,11 @@ func (c *Core) SendDatagram(data []byte, peerKey ed25519.PublicKey) error {
 	if !ok {
 		return ErrDatagramNoPeer
 	}
-	maxSize := int(conn.ConnectionState().MaxDatagramFrameSize)
-	if maxSize <= 0 {
-		return ErrDatagramNoPeer
+
+	chunks := frag.fragment(data, maxSafeDatagramSize)
+	if chunks == nil {
+		return nil // Empty payload
 	}
-	chunks := frag.fragment(data, maxSize)
 	for _, chunk := range chunks {
 		if err := conn.SendDatagram(chunk); err != nil {
 			return err

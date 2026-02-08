@@ -21,6 +21,12 @@ const (
 	fragFlagRaw    = 0x00
 	fragFlagFrag   = 0x01
 
+	// Conservative max size for each datagram passed to quic.Conn.SendDatagram().
+	// QUIC minimum UDP payload is 1200 bytes. After short header (~25B), AEAD (16B),
+	// and DATAGRAM frame header (~3B), ~1156 bytes remain for data. We use 1100 to
+	// leave comfortable margin regardless of connection ID length or PMTU state.
+	maxSafeDatagramSize = 1100
+
 	// Maximum in-flight incomplete messages per peer before oldest is evicted.
 	maxReassemblyPerPeer = 32
 	// Time after which incomplete messages are discarded.

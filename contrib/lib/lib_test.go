@@ -1467,14 +1467,24 @@ func TestDatagramTooLarge(t *testing.T) {
 	defer nodeA.Stop()
 	defer nodeB.Stop()
 
-	// 2000 bytes exceeds QUIC datagram MTU (~1200-1350)
-	bigPayload := make([]byte, 2000)
-	rand.Read(bigPayload)
-	err := nodeB.SendDatagram(bigPayload, nodeA.PublicKey())
-	if err == nil {
-		t.Fatal("expected error for oversized datagram, got nil")
+	// 2000 bytes is fragmented automatically (fits in ~2 fragments).
+	// This should succeed with fragmentation.
+	payload := make([]byte, 2000)
+	rand.Read(payload)
+	err := nodeB.SendDatagram(payload, nodeA.PublicKey())
+	if err != nil {
+		t.Fatal("SendDatagram (2000 bytes, fragmented):", err)
 	}
-	t.Logf("Correctly rejected oversized datagram: %v", err)
+
+	select {
+	case pkt := <-nodeA.ReceiveDatagrams():
+		if !bytes.Equal(pkt.Data, payload) {
+			t.Fatalf("reassembled payload mismatch: got %d bytes, want %d", len(pkt.Data), len(payload))
+		}
+		t.Log("2000-byte fragmented datagram received and reassembled correctly")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for fragmented datagram")
+	}
 }
 
 func TestDatagramNonQUICPeer(t *testing.T) {
@@ -1570,5 +1580,57 @@ func TestDatagramThroughput(t *testing.T) {
 	count := atomic.LoadInt64(&received)
 	t.Logf("Sent %d, received %d (%.1f%%), in %v",
 		numPackets, count, float64(count)/float64(numPackets)*100, elapsed)
+}
+
+func TestDatagramFragmentation(t *testing.T) {
+	nodeA, nodeB := createConnectedPair(t)
+	defer nodeA.Stop()
+	defer nodeB.Stop()
+
+	// 5000 bytes requires ~5 fragments at 1100-byte max datagram size.
+	payload := make([]byte, 5000)
+	rand.Read(payload)
+
+	if err := nodeB.SendDatagram(payload, nodeA.PublicKey()); err != nil {
+		t.Fatal("SendDatagram (fragmented):", err)
+	}
+
+	select {
+	case pkt := <-nodeA.ReceiveDatagrams():
+		if !bytes.Equal(pkt.Data, payload) {
+			t.Fatalf("reassembled payload mismatch: got %d bytes, want %d", len(pkt.Data), len(payload))
+		}
+		t.Logf("Fragmented datagram (%d bytes) reassembled successfully", len(payload))
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for fragmented datagram")
+	}
+}
+
+func TestDatagramFragmentationVariousSizes(t *testing.T) {
+	nodeA, nodeB := createConnectedPair(t)
+	defer nodeA.Stop()
+	defer nodeB.Stop()
+
+	// Test sizes from tiny to large. Max per fragment is ~1095 bytes.
+	// 255 fragments * 1095 = ~279KB max. 200000 bytes needs ~183 fragments.
+	sizes := []int{1, 100, 500, 1000, 1099, 1100, 1500, 3000, 10000, 50000, 200000}
+	for _, size := range sizes {
+		payload := make([]byte, size)
+		rand.Read(payload)
+
+		if err := nodeB.SendDatagram(payload, nodeA.PublicKey()); err != nil {
+			t.Fatalf("SendDatagram (%d bytes): %v", size, err)
+		}
+
+		select {
+		case pkt := <-nodeA.ReceiveDatagrams():
+			if !bytes.Equal(pkt.Data, payload) {
+				t.Fatalf("payload mismatch at size %d: got %d bytes", size, len(pkt.Data))
+			}
+			t.Logf("  %d bytes: OK", size)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout at size %d", size)
+		}
+	}
 }
 
