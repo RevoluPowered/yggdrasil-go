@@ -1634,3 +1634,245 @@ func TestDatagramFragmentationVariousSizes(t *testing.T) {
 	}
 }
 
+// TestDatagramProtocolPacket sends data in the exact wire format that the C++
+// GDExtension _put_packet produces: [MSG_DATA(0x05)][peer_id:4B][mode:1B][channel:1B][game_data].
+// This verifies that real game traffic survives the fragmentation round-trip.
+func TestDatagramProtocolPacket(t *testing.T) {
+	nodeA, nodeB := createConnectedPair(t)
+	defer nodeA.Stop()
+	defer nodeB.Stop()
+
+	// Build a realistic protocol packet like _put_packet does.
+	buildPacket := func(peerID uint32, mode, channel uint8, gameData []byte) []byte {
+		msg := make([]byte, 1+4+1+1+len(gameData))
+		msg[0] = 0x05 // MSG_DATA
+		msg[1] = byte(peerID >> 24)
+		msg[2] = byte(peerID >> 16)
+		msg[3] = byte(peerID >> 8)
+		msg[4] = byte(peerID)
+		msg[5] = mode
+		msg[6] = channel
+		copy(msg[7:], gameData)
+		return msg
+	}
+
+	// Small packet — fits in a single datagram (no fragmentation)
+	smallGame := make([]byte, 100)
+	rand.Read(smallGame)
+	smallPkt := buildPacket(42, 0, 0, smallGame)
+
+	if err := nodeB.SendDatagram(smallPkt, nodeA.PublicKey()); err != nil {
+		t.Fatal("small protocol packet send:", err)
+	}
+	select {
+	case pkt := <-nodeA.ReceiveDatagrams():
+		if !bytes.Equal(pkt.Data, smallPkt) {
+			t.Fatal("small protocol packet mismatch")
+		}
+		if pkt.Data[0] != 0x05 {
+			t.Fatal("MSG_DATA type byte corrupted")
+		}
+		gotID := uint32(pkt.Data[1])<<24 | uint32(pkt.Data[2])<<16 | uint32(pkt.Data[3])<<8 | uint32(pkt.Data[4])
+		if gotID != 42 {
+			t.Fatalf("peer_id corrupted: got %d, want 42", gotID)
+		}
+		if !bytes.Equal(pkt.Data[7:], smallGame) {
+			t.Fatal("game data corrupted in small packet")
+		}
+		t.Log("Small protocol packet (107 bytes): OK")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout on small protocol packet")
+	}
+
+	// Large packet — requires fragmentation (simulates a big state update)
+	bigGame := make([]byte, 8000)
+	rand.Read(bigGame)
+	bigPkt := buildPacket(99, 2, 3, bigGame) // mode=2 (unreliable), channel=3
+
+	if err := nodeB.SendDatagram(bigPkt, nodeA.PublicKey()); err != nil {
+		t.Fatal("large protocol packet send:", err)
+	}
+	select {
+	case pkt := <-nodeA.ReceiveDatagrams():
+		if !bytes.Equal(pkt.Data, bigPkt) {
+			t.Fatalf("large protocol packet mismatch: got %d bytes, want %d", len(pkt.Data), len(bigPkt))
+		}
+		if pkt.Data[0] != 0x05 {
+			t.Fatal("MSG_DATA type byte corrupted after fragmentation")
+		}
+		gotID := uint32(pkt.Data[1])<<24 | uint32(pkt.Data[2])<<16 | uint32(pkt.Data[3])<<8 | uint32(pkt.Data[4])
+		if gotID != 99 {
+			t.Fatalf("peer_id corrupted after fragmentation: got %d, want 99", gotID)
+		}
+		if pkt.Data[5] != 2 || pkt.Data[6] != 3 {
+			t.Fatalf("mode/channel corrupted: got %d/%d, want 2/3", pkt.Data[5], pkt.Data[6])
+		}
+		if !bytes.Equal(pkt.Data[7:], bigGame) {
+			t.Fatal("game data corrupted after fragmentation")
+		}
+		t.Logf("Large protocol packet (%d bytes, fragmented): OK", len(bigPkt))
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout on large protocol packet")
+	}
+}
+
+// TestLateClientJoin reproduces the exact GDScript test pattern:
+// 1. Create server + 9 relays, chain via CallPeer
+// 2. Wait for partial tree convergence (tree >= 2) + 1s pause
+// 3. Create client LATE, connect to relay8
+// 4. Start bgReader on server and client
+// 5. Client sends to server repeatedly
+// This isolates whether the late-join pattern works in pure Go.
+func TestLateClientJoin(t *testing.T) {
+	const numRelays = 9
+	const sendInterval = 83 * time.Millisecond
+	const timeout = 120 * time.Second
+
+	logger := log.New(os.Stderr, "", 0)
+	logger.EnableLevel("info")
+	logger.EnableLevel("warn")
+	logger.EnableLevel("error")
+
+	// Step 1: Create server + 9 relays
+	numInitial := 1 + numRelays // server + relays
+	nodes := make([]*core.Core, numInitial)
+	for i := 0; i < numInitial; i++ {
+		cfg := config.GenerateConfig()
+		if err := cfg.GenerateSelfSignedCertificate(); err != nil {
+			t.Fatal(err)
+		}
+		node, err := core.New(cfg.Certificate, logger)
+		if err != nil {
+			t.Fatalf("node %d: %v", i, err)
+		}
+		defer node.Stop()
+		nodes[i] = node
+	}
+
+	// Step 2: Chain them: node[i] listens, node[i+1] CallPeers
+	lastRelayListener := (*core.Listener)(nil)
+	for i := 0; i < numInitial-1; i++ {
+		lURL, _ := url.Parse("quic://localhost:0")
+		rl, err := nodes[i].Listen(lURL, "")
+		if err != nil {
+			t.Fatalf("node %d Listen: %v", i, err)
+		}
+		if i == numInitial-2 {
+			// Save relay8's listener for the client later
+			lURL2, _ := url.Parse("quic://localhost:0")
+			lastRelayListener, err = nodes[i+1].Listen(lURL2, "")
+			if err != nil {
+				t.Fatalf("relay8 extra Listen: %v", err)
+			}
+		}
+		peerURL, _ := url.Parse("quic://" + rl.Addr().String())
+		if err := nodes[i+1].CallPeer(peerURL, ""); err != nil {
+			t.Fatalf("node %d CallPeer: %v", i+1, err)
+		}
+	}
+
+	// Step 3: Wait for partial convergence (tree >= 2) like GDScript test
+	for attempt := 0; attempt < 200; attempt++ {
+		time.Sleep(100 * time.Millisecond)
+		allReady := true
+		for _, node := range nodes {
+			if len(node.GetTree()) < 2 {
+				allReady = false
+				break
+			}
+		}
+		if allReady {
+			t.Logf("All initial nodes have tree >= 2 after %dms", (attempt+1)*100)
+			break
+		}
+		if attempt == 199 {
+			t.Log("WARNING: not all initial nodes have tree >= 2 after 20s")
+		}
+	}
+
+	// Step 4: 1 second pause (matching GDScript test)
+	time.Sleep(time.Second)
+
+	// Log tree state
+	for i, node := range nodes {
+		t.Logf("  node %d tree: %d", i, len(node.GetTree()))
+	}
+
+	// Step 5: Create client LATE (like GDScript pattern)
+	cfg := config.GenerateConfig()
+	if err := cfg.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+	client, err := core.New(cfg.Certificate, logger)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	defer client.Stop()
+
+	// Connect client to relay8
+	relay8Addr := lastRelayListener.Addr().String()
+	peerURL, _ := url.Parse("quic://" + relay8Addr)
+	if err := client.CallPeer(peerURL, ""); err != nil {
+		t.Fatalf("client CallPeer: %v", err)
+	}
+	t.Logf("Client created and connected to relay8 at %s", relay8Addr)
+
+	// Step 6: Start bgReader on server and client
+	server := nodes[0]
+	srvRecvCh, srvKnownPeers := capiStyleBgReader(server)
+	clientRecvCh, clientKnownPeers := capiStyleBgReader(client)
+
+	// Server echoes
+	go func() {
+		for pkt := range srvRecvCh {
+			senderKey := []byte(pkt.from.(iwt.Addr))
+			capiStyleSendTo(server, srvKnownPeers, ed25519.PublicKey(senderKey), pkt.data)
+		}
+	}()
+
+	// Step 7: Client sends in a loop
+	serverPubKey := server.PublicKey()
+	payload := make([]byte, 100)
+	rand.Read(payload)
+
+	t.Log("Starting send loop (late-join client)...")
+	sendStart := time.Now()
+	var sendCount int
+
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		ticker := time.NewTicker(sendInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sendCount++
+				capiStyleSendTo(client, clientKnownPeers, serverPubKey, payload)
+				if sendCount <= 10 || sendCount%50 == 0 {
+					t.Logf("  send #%d (elapsed %v, client_tree=%d)", sendCount, time.Since(sendStart), len(client.GetTree()))
+				}
+			case <-clientRecvCh:
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-sendDone:
+		elapsed := time.Since(sendStart)
+		t.Logf("=== LATE CLIENT JOIN ===")
+		t.Logf("First response after %d sends, %v", sendCount, elapsed)
+		t.Logf("Client tree: %d, Server tree: %d", len(client.GetTree()), len(server.GetTree()))
+		if elapsed > 30*time.Second {
+			t.Errorf("Too slow! Expected <30s, got %v", elapsed)
+		}
+	case <-time.After(timeout):
+		t.Logf("Client tree at timeout: %d", len(client.GetTree()))
+		t.Logf("Server tree at timeout: %d", len(server.GetTree()))
+		for i, node := range nodes {
+			t.Logf("  node %d tree: %d", i, len(node.GetTree()))
+		}
+		t.Fatalf("TIMEOUT after %v (%d sends)", timeout, sendCount)
+	}
+}

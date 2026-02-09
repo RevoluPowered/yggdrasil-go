@@ -27,6 +27,7 @@ import (
 	"time"
 	"unsafe"
 
+	iwenc "github.com/Arceliar/ironwood/encrypted"
 	iwt "github.com/Arceliar/ironwood/types"
 	"github.com/gologme/log"
 
@@ -158,6 +159,15 @@ func ygg_start(configJSON *C.char, logCb C.ygg_log_callback) C.int {
 	logger.EnableLevel("warn")
 	logger.EnableLevel("info")
 	node.logger = logger
+
+	// Route Ironwood session trace logs through the same callback
+	if logCb != nil {
+		iwenc.SessionLogFunc = func(msg string) {
+			cstr := C.CString(msg)
+			C.call_log_cb(logCb, cstr, 0) // level 0 = trace
+			C.free(unsafe.Pointer(cstr))
+		}
+	}
 
 	// Config
 	node.config = config.GenerateConfig()
@@ -554,13 +564,13 @@ func ygg_recv_from_unreliable(handle C.int, buf unsafe.Pointer, bufLen C.int, pe
 		select {
 		case pkt, ok = <-node.dgRecvCh:
 		default:
-			return -1
+			return 0 // No data available (poll)
 		}
 	} else {
 		select {
 		case pkt, ok = <-node.dgRecvCh:
 		case <-time.After(time.Duration(timeoutMs) * time.Millisecond):
-			return -1
+			return 0 // Timeout, no data
 		}
 	}
 	if !ok {
@@ -776,6 +786,36 @@ func ygg_get_routing_entries(handle C.int) C.int {
 		return 0
 	}
 	return C.int(node.core.GetSelf().RoutingEntries)
+}
+
+//export ygg_get_tree_entries
+func ygg_get_tree_entries(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		return 0
+	}
+	return C.int(len(node.core.GetTree()))
+}
+
+// ygg_has_route checks whether Ironwood has discovered a route to the given
+// public key. Returns 1 if a route is known (knownPeers contains the key),
+// 0 if not. This is useful for avoiding silent packet drops — ygg_send_to
+// will silently drop packets when no route exists.
+//
+//export ygg_has_route
+func ygg_has_route(handle C.int, peerKeyHex *C.char) C.int {
+	node := getNode(handle)
+	if node == nil {
+		return 0
+	}
+	keyBytes, err := hex.DecodeString(C.GoString(peerKeyHex))
+	if err != nil {
+		return 0
+	}
+	if _, known := node.knownPeers.Load(string(keyBytes)); known {
+		return 1
+	}
+	return 0
 }
 
 //export ygg_get_version
