@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"sync"
+	"time"
 
 	iwe "github.com/Arceliar/ironwood/encrypted"
 	iwn "github.com/Arceliar/ironwood/network"
@@ -118,6 +119,7 @@ func New(cert *tls.Certificate, logger Logger, opts ...SetupOption) (*Core, erro
 		iwn.WithBloomTransform(keyXform),
 		iwn.WithPeerMaxMessageSize(65535*2),
 		iwn.WithPathNotify(c.doPathNotify),
+		iwn.WithPeerQueueTimeout(5*time.Second),
 	); err != nil {
 		return nil, fmt.Errorf("error creating encryption: %w", err)
 	}
