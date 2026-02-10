@@ -2,3 +2,6 @@
 	path = ironwood
 	url = git@github.com:RevoluPowered/ironwood.git
 	branch = gordon/add-support-for-unreliable-fragmentation-over-quic
+[submodule "quic-go"]
+	path = quic-go
+	url = git@github.com:RevoluPowered/quic-go.git

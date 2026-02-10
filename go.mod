@@ -4,6 +4,8 @@ go 1.24.0
 
 replace github.com/Arceliar/ironwood => ./ironwood
 
+replace github.com/quic-go/quic-go => ./quic-go
+
 require (
 	github.com/Arceliar/ironwood v0.0.0-20260117132459-7017dbc41d8e
 	github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d

@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	iwenc "github.com/Arceliar/ironwood/encrypted"
 	iwt "github.com/Arceliar/ironwood/types"
 	"github.com/gologme/log"
 
@@ -21,12 +23,30 @@ import (
 	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
 )
 
+func TestMain(m *testing.M) {
+	// Gate [IW-SESSION] prints behind -v flag
+	iwenc.SessionLogFunc = func(msg string) {
+		if testing.Verbose() {
+			fmt.Fprint(os.Stderr, msg)
+		}
+	}
+	os.Exit(m.Run())
+}
+
+func testLogger() *log.Logger {
+	if testing.Verbose() {
+		l := log.New(os.Stderr, "", 0)
+		l.EnableLevel("info")
+		l.EnableLevel("warn")
+		l.EnableLevel("error")
+		return l
+	}
+	return log.New(io.Discard, "", 0)
+}
+
 func createConnectedPair(t *testing.T) (*core.Core, *core.Core) {
 	t.Helper()
-	logger := log.New(os.Stderr, "", 0)
-	logger.EnableLevel("info")
-	logger.EnableLevel("warn")
-	logger.EnableLevel("error")
+	logger := testLogger()
 
 	cfgA, cfgB := config.GenerateConfig(), config.GenerateConfig()
 	if err := cfgA.GenerateSelfSignedCertificate(); err != nil {
@@ -122,10 +142,7 @@ func TestCoreWriteToReadFrom(t *testing.T) {
 // Returns the server, clients slice, and a cleanup function.
 func createServerWithClients(t *testing.T, numClients int) (*core.Core, []*core.Core, func()) {
 	t.Helper()
-	logger := log.New(os.Stderr, "", 0)
-	logger.EnableLevel("info")
-	logger.EnableLevel("warn")
-	logger.EnableLevel("error")
+	logger := testLogger()
 
 	srvCfg := config.GenerateConfig()
 	if err := srvCfg.GenerateSelfSignedCertificate(); err != nil {
@@ -401,7 +418,7 @@ func TestThroughput(t *testing.T) {
 // Packets from node 0 to node n-1 traverse all intermediate hops.
 func createChain(t *testing.T, numNodes int) ([]*core.Core, func()) {
 	t.Helper()
-	logger := log.New(os.Stderr, "", 0)
+	logger := testLogger()
 
 	nodes := make([]*core.Core, numNodes)
 	for i := range nodes {
@@ -572,7 +589,7 @@ func TestLatencyWithIPRWCRelays(t *testing.T) {
 	const packetSize = 1500
 	const maxHops = 64
 
-	logger := log.New(os.Stderr, "", 0)
+	logger := testLogger()
 
 	numNodes := maxHops + 1
 	nodes := make([]*core.Core, numNodes)
@@ -819,10 +836,7 @@ func TestCAPIStyleTenHopChain(t *testing.T) {
 	const sendInterval = 83 * time.Millisecond
 	const timeout = 120 * time.Second
 
-	logger := log.New(os.Stderr, "", 0)
-	logger.EnableLevel("info")
-	logger.EnableLevel("warn")
-	logger.EnableLevel("error")
+	logger := testLogger()
 
 	// --- Server (node 0): Listen only, no outbound peers ---
 	// This matches C API: ygg_start (no Peers in config) + ygg_listen
@@ -990,10 +1004,7 @@ func TestCAPIStyleNoSendLookup(t *testing.T) {
 	const sendInterval = 83 * time.Millisecond
 	const timeout = 120 * time.Second
 
-	logger := log.New(os.Stderr, "", 0)
-	logger.EnableLevel("info")
-	logger.EnableLevel("warn")
-	logger.EnableLevel("error")
+	logger := testLogger()
 
 	// Server
 	srvCfg := config.GenerateConfig()
@@ -1122,10 +1133,7 @@ func TestCAPIStyleWithCallPeer(t *testing.T) {
 	const sendInterval = 83 * time.Millisecond
 	const timeout = 120 * time.Second
 
-	logger := log.New(os.Stderr, "", 0)
-	logger.EnableLevel("info")
-	logger.EnableLevel("warn")
-	logger.EnableLevel("error")
+	logger := testLogger()
 
 	// Create ALL nodes first, then chain them (matching createChain pattern)
 	numNodes := 1 + numRelays + 1 // server + relays + client
@@ -1489,10 +1497,7 @@ func TestDatagramTooLarge(t *testing.T) {
 
 func TestDatagramNonQUICPeer(t *testing.T) {
 	// Create a pair connected via TCP instead of QUIC
-	logger := log.New(os.Stderr, "", 0)
-	logger.EnableLevel("info")
-	logger.EnableLevel("warn")
-	logger.EnableLevel("error")
+	logger := testLogger()
 
 	cfgA, cfgB := config.GenerateConfig(), config.GenerateConfig()
 	cfgA.GenerateSelfSignedCertificate()
@@ -1728,10 +1733,7 @@ func TestLateClientJoin(t *testing.T) {
 	const sendInterval = 83 * time.Millisecond
 	const timeout = 120 * time.Second
 
-	logger := log.New(os.Stderr, "", 0)
-	logger.EnableLevel("info")
-	logger.EnableLevel("warn")
-	logger.EnableLevel("error")
+	logger := testLogger()
 
 	// Step 1: Create server + 9 relays
 	numInitial := 1 + numRelays // server + relays
