@@ -335,6 +335,18 @@ func TestThroughput(t *testing.T) {
 			defer nodeA.Stop()
 			defer nodeB.Stop()
 
+			// Packet capture for debugging hangs
+			pcapDir := fmt.Sprintf("/tmp/ygg-throughput/%s", tc.name)
+			os.MkdirAll(pcapDir, 0755)
+			inspA := NewPacketInspector("recv-A",
+				WithPcap(fmt.Sprintf("%s/recv-A.pcap", pcapDir)),
+				WithTextLog(os.Stderr))
+			inspB := NewPacketInspector("send-B",
+				WithPcap(fmt.Sprintf("%s/send-B.pcap", pcapDir)),
+				WithTextLog(os.Stderr))
+			defer inspA.Close()
+			defer inspB.Close()
+
 			// B needs a read loop running for session establishment (ack processing)
 			go func() {
 				buf := make([]byte, packetSize)
@@ -353,11 +365,13 @@ func TestThroughput(t *testing.T) {
 			addr := nodeA.LocalAddr()
 
 			// Warmup: establish encrypted session before timing
+			inspB.CaptureEvent("warmup-send")
 			nodeB.WriteTo(msg, addr)
 			warmupBuf := make([]byte, packetSize)
 			if _, _, err := nodeA.ReadFrom(warmupBuf); err != nil {
 				t.Fatalf("warmup ReadFrom: %v", err)
 			}
+			inspA.CaptureEvent("warmup-recv-done")
 
 			// Receiver on A
 			var recvCount atomic.Int64
@@ -366,31 +380,45 @@ func TestThroughput(t *testing.T) {
 			go func() {
 				buf := make([]byte, packetSize)
 				for i := 0; i < numPackets; i++ {
-					if _, _, err := nodeA.ReadFrom(buf); err != nil {
+					n, from, err := nodeA.ReadFrom(buf)
+					if err != nil {
 						recvErr.Store(err)
+						inspA.CaptureEvent("recv-error", fmt.Sprintf("i=%d err=%v", i, err))
 						return
 					}
 					recvCount.Add(1)
+					if i < 3 || i == numPackets-1 || (i%10000 == 0) {
+						inspA.Capture(DirRecv, from, nodeA.LocalAddr(), buf[:n],
+							fmt.Sprintf("pkt=%d/%d", i, numPackets))
+					}
 				}
 				close(recvDone)
 			}()
 
 			// Sender on B (main goroutine)
+			inspB.CaptureEvent("send-start", fmt.Sprintf("numPackets=%d", numPackets))
 			start := time.Now()
 			for i := 0; i < numPackets; i++ {
 				if _, err := nodeB.WriteTo(msg, addr); err != nil {
+					inspB.CaptureEvent("send-error", fmt.Sprintf("i=%d err=%v", i, err))
 					t.Fatalf("WriteTo %d: %v", i, err)
 				}
+				if i < 3 || i == numPackets-1 || (i%10000 == 0) {
+					inspB.CaptureEvent("sent", fmt.Sprintf("pkt=%d/%d", i, numPackets))
+				}
 			}
+			inspB.CaptureEvent("send-done", fmt.Sprintf("elapsed=%v", time.Since(start)))
 
 			// Wait for all packets to arrive
 			select {
 			case <-recvDone:
 			case <-time.After(time.Duration(60+tc.totalSize/5_000_000) * time.Second):
+				inspA.CaptureEvent("TIMEOUT", fmt.Sprintf("recv=%d/%d", recvCount.Load(), numPackets))
+				inspB.CaptureEvent("TIMEOUT", fmt.Sprintf("recv=%d/%d", recvCount.Load(), numPackets))
 				if e := recvErr.Load(); e != nil {
 					t.Fatalf("receiver error after %d/%d packets: %v", recvCount.Load(), numPackets, e)
 				}
-				t.Fatalf("timeout: received %d/%d packets", recvCount.Load(), numPackets)
+				t.Fatalf("timeout: received %d/%d packets (pcaps in %s)", recvCount.Load(), numPackets, pcapDir)
 			}
 			elapsed := time.Since(start)
 
