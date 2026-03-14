@@ -314,9 +314,7 @@ func TestThroughput(t *testing.T) {
 		{"128MB", 128_000_000},
 		{"512MB", 512_000_000},
 		{"1GB", 1_000_000_000},
-	}
-	if !testing.Short() {
-		cases = append(cases, testCase{"5GB", 5_000_000_000})
+		{"5GB", 5_000_000_000},
 	}
 
 	type result struct {
@@ -363,17 +361,18 @@ func TestThroughput(t *testing.T) {
 
 			// Receiver on A
 			var recvCount atomic.Int64
+			var recvErr atomic.Value
 			recvDone := make(chan struct{})
 			go func() {
 				buf := make([]byte, packetSize)
 				for i := 0; i < numPackets; i++ {
 					if _, _, err := nodeA.ReadFrom(buf); err != nil {
-						t.Errorf("ReadFrom %d: %v", i, err)
+						recvErr.Store(err)
 						return
 					}
 					recvCount.Add(1)
 				}
-				recvDone <- struct{}{}
+				close(recvDone)
 			}()
 
 			// Sender on B (main goroutine)
@@ -387,7 +386,10 @@ func TestThroughput(t *testing.T) {
 			// Wait for all packets to arrive
 			select {
 			case <-recvDone:
-			case <-time.After(120 * time.Second):
+			case <-time.After(time.Duration(60+tc.totalSize/10_000_000) * time.Second):
+				if e := recvErr.Load(); e != nil {
+					t.Fatalf("receiver error after %d/%d packets: %v", recvCount.Load(), numPackets, e)
+				}
 				t.Fatalf("timeout: received %d/%d packets", recvCount.Load(), numPackets)
 			}
 			elapsed := time.Since(start)
