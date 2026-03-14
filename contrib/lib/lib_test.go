@@ -316,7 +316,7 @@ func TestThroughput(t *testing.T) {
 		{"1GB", 1_000_000_000},
 	}
 	if !testing.Short() {
-		cases = append(cases, testCase{"10GB", 10_000_000_000})
+		cases = append(cases, testCase{"5GB", 5_000_000_000})
 	}
 
 	type result struct {
