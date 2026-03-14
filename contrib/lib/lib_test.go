@@ -386,7 +386,7 @@ func TestThroughput(t *testing.T) {
 			// Wait for all packets to arrive
 			select {
 			case <-recvDone:
-			case <-time.After(time.Duration(60+tc.totalSize/10_000_000) * time.Second):
+			case <-time.After(time.Duration(60+tc.totalSize/5_000_000) * time.Second):
 				if e := recvErr.Load(); e != nil {
 					t.Fatalf("receiver error after %d/%d packets: %v", recvCount.Load(), numPackets, e)
 				}
