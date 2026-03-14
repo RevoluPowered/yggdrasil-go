@@ -120,6 +120,7 @@ func New(cert *tls.Certificate, logger Logger, opts ...SetupOption) (*Core, erro
 		iwn.WithPeerMaxMessageSize(65535*2),
 		iwn.WithPathNotify(c.doPathNotify),
 		iwn.WithPeerQueueTimeout(5*time.Second),
+		iwn.WithCipherMode(iwn.CipherAESGCM),
 	); err != nil {
 		return nil, fmt.Errorf("error creating encryption: %w", err)
 	}

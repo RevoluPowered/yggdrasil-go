@@ -589,6 +589,13 @@ func TestLatencyWithIPRWCRelays(t *testing.T) {
 	const packetSize = 1500
 	const maxHops = 64
 
+	// Build set of target node indices — these will run echo servers,
+	// so they must NOT have a competing relay reader.
+	targetSet := make(map[int]bool)
+	for _, h := range hopCounts {
+		targetSet[h] = true
+	}
+
 	logger := testLogger()
 
 	numNodes := maxHops + 1
@@ -616,8 +623,9 @@ func TestLatencyWithIPRWCRelays(t *testing.T) {
 		}
 		iprwcs[i] = rwc
 
-		// Start a reader goroutine on intermediate nodes (like Godot's recv thread)
-		if i > 0 && i < numNodes-1 {
+		// Start a reader goroutine on intermediate nodes (like Godot's recv thread).
+		// Skip node 0 (sender), target nodes (echo servers), to avoid racing on Read().
+		if i > 0 && i < numNodes-1 && !targetSet[i] {
 			go func(r *ipv6rwc.ReadWriteCloser) {
 				buf := make([]byte, 65536)
 				for {
