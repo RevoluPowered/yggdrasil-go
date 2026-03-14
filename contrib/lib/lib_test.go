@@ -335,18 +335,6 @@ func TestThroughput(t *testing.T) {
 			defer nodeA.Stop()
 			defer nodeB.Stop()
 
-			// Packet capture for debugging hangs
-			pcapDir := fmt.Sprintf("/tmp/ygg-throughput/%s", tc.name)
-			os.MkdirAll(pcapDir, 0755)
-			inspA := NewPacketInspector("recv-A",
-				WithPcap(fmt.Sprintf("%s/recv-A.pcap", pcapDir)),
-				WithTextLog(os.Stderr))
-			inspB := NewPacketInspector("send-B",
-				WithPcap(fmt.Sprintf("%s/send-B.pcap", pcapDir)),
-				WithTextLog(os.Stderr))
-			defer inspA.Close()
-			defer inspB.Close()
-
 			// B needs a read loop running for session establishment (ack processing)
 			go func() {
 				buf := make([]byte, packetSize)
@@ -365,13 +353,11 @@ func TestThroughput(t *testing.T) {
 			addr := nodeA.LocalAddr()
 
 			// Warmup: establish encrypted session before timing
-			inspB.CaptureEvent("warmup-send")
 			nodeB.WriteTo(msg, addr)
 			warmupBuf := make([]byte, packetSize)
 			if _, _, err := nodeA.ReadFrom(warmupBuf); err != nil {
 				t.Fatalf("warmup ReadFrom: %v", err)
 			}
-			inspA.CaptureEvent("warmup-recv-done")
 
 			// Receiver on A
 			var recvCount atomic.Int64
@@ -380,45 +366,33 @@ func TestThroughput(t *testing.T) {
 			go func() {
 				buf := make([]byte, packetSize)
 				for i := 0; i < numPackets; i++ {
-					n, from, err := nodeA.ReadFrom(buf)
-					if err != nil {
+					if _, _, err := nodeA.ReadFrom(buf); err != nil {
 						recvErr.Store(err)
-						inspA.CaptureEvent("recv-error", fmt.Sprintf("i=%d err=%v", i, err))
 						return
 					}
 					recvCount.Add(1)
-					if i < 3 || i == numPackets-1 || (i%10000 == 0) {
-						inspA.Capture(DirRecv, from, nodeA.LocalAddr(), buf[:n],
-							fmt.Sprintf("pkt=%d/%d", i, numPackets))
-					}
 				}
 				close(recvDone)
 			}()
 
 			// Sender on B (main goroutine)
-			inspB.CaptureEvent("send-start", fmt.Sprintf("numPackets=%d", numPackets))
+			// With backpressure, WriteTo blocks when pipeline is full,
+			// naturally pacing the sender to the receiver's speed.
 			start := time.Now()
 			for i := 0; i < numPackets; i++ {
 				if _, err := nodeB.WriteTo(msg, addr); err != nil {
-					inspB.CaptureEvent("send-error", fmt.Sprintf("i=%d err=%v", i, err))
 					t.Fatalf("WriteTo %d: %v", i, err)
 				}
-				if i < 3 || i == numPackets-1 || (i%10000 == 0) {
-					inspB.CaptureEvent("sent", fmt.Sprintf("pkt=%d/%d", i, numPackets))
-				}
 			}
-			inspB.CaptureEvent("send-done", fmt.Sprintf("elapsed=%v", time.Since(start)))
 
 			// Wait for all packets to arrive
 			select {
 			case <-recvDone:
 			case <-time.After(time.Duration(60+tc.totalSize/5_000_000) * time.Second):
-				inspA.CaptureEvent("TIMEOUT", fmt.Sprintf("recv=%d/%d", recvCount.Load(), numPackets))
-				inspB.CaptureEvent("TIMEOUT", fmt.Sprintf("recv=%d/%d", recvCount.Load(), numPackets))
 				if e := recvErr.Load(); e != nil {
 					t.Fatalf("receiver error after %d/%d packets: %v", recvCount.Load(), numPackets, e)
 				}
-				t.Fatalf("timeout: received %d/%d packets (pcaps in %s)", recvCount.Load(), numPackets, pcapDir)
+				t.Fatalf("timeout: received %d/%d packets", recvCount.Load(), numPackets)
 			}
 			elapsed := time.Since(start)
 
@@ -448,6 +422,134 @@ func TestThroughput(t *testing.T) {
 		fmt.Printf("  %-8s %12v %10s\n", r.name, r.elapsed.Round(time.Microsecond), rate)
 	}
 	fmt.Println()
+}
+
+// TestReliableDelivery verifies that the reliable path (WriteTo/ReadFrom) delivers
+// all packets without loss, even when the sender is faster than the receiver.
+// With backpressure (inflight semaphore), WriteTo blocks when the pipeline is full,
+// naturally pacing the sender.
+func TestReliableDelivery(t *testing.T) {
+	nodeA, nodeB := createConnectedPair(t)
+	defer nodeA.Stop()
+	defer nodeB.Stop()
+
+	const packetSize = 60_000
+	const numPackets = 1_000 // 60 MB — enough to exercise backpressure
+
+	msg := make([]byte, packetSize)
+	rand.Read(msg[40:])
+	msg[0] = 0x60
+	copy(msg[8:24], nodeB.Address())
+	copy(msg[24:40], nodeA.Address())
+	addr := nodeA.LocalAddr()
+
+	// B needs a read loop for session establishment
+	go func() {
+		buf := make([]byte, packetSize)
+		for {
+			if _, _, err := nodeB.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Warmup: establish session
+	nodeB.WriteTo(msg, addr)
+	warmupBuf := make([]byte, packetSize)
+	if _, _, err := nodeA.ReadFrom(warmupBuf); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+
+	// Concurrent receiver
+	var recvCount atomic.Int64
+	recvDone := make(chan struct{})
+	go func() {
+		buf := make([]byte, packetSize)
+		for i := 0; i < numPackets; i++ {
+			if _, _, err := nodeA.ReadFrom(buf); err != nil {
+				t.Errorf("ReadFrom %d: %v", i, err)
+				return
+			}
+			recvCount.Add(1)
+		}
+		close(recvDone)
+	}()
+
+	// Sender — WriteTo should block when pipeline is full (backpressure)
+	sendStart := time.Now()
+	for i := 0; i < numPackets; i++ {
+		if _, err := nodeB.WriteTo(msg, addr); err != nil {
+			t.Fatalf("WriteTo %d: %v", i, err)
+		}
+	}
+	sendElapsed := time.Since(sendStart)
+	t.Logf("Sent %d packets (%d MB) in %v", numPackets, numPackets*packetSize/1_000_000, sendElapsed)
+
+	select {
+	case <-recvDone:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("timeout: received %d/%d packets", recvCount.Load(), numPackets)
+	}
+
+	got := recvCount.Load()
+	if got != int64(numPackets) {
+		t.Fatalf("FAIL: received %d/%d packets — reliable path lost %d packets", got, numPackets, numPackets-int(got))
+	}
+	t.Logf("PASS: all %d packets delivered (reliable path, backpressure working)", numPackets)
+}
+
+// TestUnreliableDelivery verifies that the unreliable path (QUIC datagrams via
+// SendDatagram/ReceiveDatagrams) works and gracefully handles drops under load.
+func TestUnreliableDelivery(t *testing.T) {
+	nodeA, nodeB := createConnectedPair(t)
+	defer nodeA.Stop()
+	defer nodeB.Stop()
+
+	const numPackets = 500
+	const payloadSize = 100
+
+	// Verify datagram support
+	if !nodeA.HasDatagramSupport(nodeB.PublicKey()) {
+		t.Fatal("A does not have datagram support to B")
+	}
+
+	// Receiver
+	var received atomic.Int64
+	recvDone := make(chan struct{})
+	go func() {
+		ch := nodeA.ReceiveDatagrams()
+		for {
+			select {
+			case pkt := <-ch:
+				if len(pkt.Data) == payloadSize {
+					received.Add(1)
+				}
+			case <-time.After(3 * time.Second):
+				close(recvDone)
+				return
+			}
+		}
+	}()
+
+	// Blast sender — no backpressure on datagram path, some may drop
+	for i := 0; i < numPackets; i++ {
+		payload := make([]byte, payloadSize)
+		payload[0] = byte(i)
+		if err := nodeB.SendDatagram(payload, nodeA.PublicKey()); err != nil {
+			t.Fatalf("SendDatagram %d: %v", i, err)
+		}
+	}
+
+	<-recvDone
+	got := received.Load()
+	t.Logf("Unreliable: received %d/%d packets (%.1f%% delivery)",
+		got, numPackets, float64(got)/float64(numPackets)*100)
+
+	if got == 0 {
+		t.Fatal("FAIL: zero packets received on unreliable path")
+	}
+	// Unreliable path may drop packets — that's expected. Just verify some arrive.
+	t.Logf("PASS: unreliable path delivered %d packets (drops are expected)", got)
 }
 
 // createChain creates a linear chain of numNodes: 0 ←→ 1 ←→ 2 ←→ ... ←→ (n-1).
