@@ -395,7 +395,10 @@ func TestThroughput(t *testing.T) {
 			elapsed := time.Since(start)
 
 			totalBytes := int64(packetSize) * int64(numPackets)
-			mbps := float64(totalBytes) / elapsed.Seconds() / 1_000_000
+			var mbps float64
+			if elapsed > 0 {
+				mbps = float64(totalBytes) / elapsed.Seconds() / 1_000_000
+			}
 			results = append(results, result{tc.name, tc.totalSize, mbps, elapsed})
 			t.Logf("%d packets in %v (%.2f MB/s)", numPackets, elapsed, mbps)
 		})
