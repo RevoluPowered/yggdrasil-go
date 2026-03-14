@@ -1,0 +1,5 @@
+# Test binaries and profiling
+*.test
+*.prof
+*.out
+contrib/lib/lib
