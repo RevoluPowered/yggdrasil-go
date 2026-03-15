@@ -2,6 +2,7 @@ package core
 
 import (
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/json"
 	"net"
 	"net/url"
@@ -193,6 +194,11 @@ func (c *Core) SetLogger(log Logger) {
 	c.log = log
 }
 
+// TLSConfig returns the TLS config used by the core for QUIC/TLS connections.
+func (c *Core) TLSConfig() *tls.Config {
+	return c.config.tls
+}
+
 // AddPeer adds a peer. This should be specified in the peer URI format, e.g.:
 //
 //	tcp://a.b.c.d:e
@@ -224,6 +230,25 @@ func (c *Core) CallPeer(u *url.URL, sintf string) error {
 
 func (c *Core) PublicKey() ed25519.PublicKey {
 	return c.public
+}
+
+// AllowPublicKey adds a public key to the AllowedPublicKeys set at runtime.
+// If the set is non-empty, only keys in the set are allowed for incoming peerings.
+func (c *Core) AllowPublicKey(key ed25519.PublicKey) {
+	var pk [32]byte
+	copy(pk[:], key)
+	phony.Block(c, func() {
+		c.config._allowedPublicKeys[pk] = struct{}{}
+	})
+}
+
+// DisallowPublicKey removes a public key from the AllowedPublicKeys set at runtime.
+func (c *Core) DisallowPublicKey(key ed25519.PublicKey) {
+	var pk [32]byte
+	copy(pk[:], key)
+	phony.Block(c, func() {
+		delete(c.config._allowedPublicKeys, pk)
+	})
 }
 
 // Hack to get the admin stuff working, TODO something cleaner

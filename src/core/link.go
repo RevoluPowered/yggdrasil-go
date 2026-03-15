@@ -323,6 +323,8 @@ func (l *links) add(u *url.URL, sintf string, linkType linkType) error {
 				if err != nil || conn == nil {
 					if err == nil && conn == nil {
 						l.core.log.Warnf("Link %q reached inconsistent error state", u.String())
+					} else if err != nil {
+						l.core.log.Warnf("Link %q connect error: %v", u.String(), err)
 					}
 					if linkType == linkTypePersistent {
 						// If the link is a persistent configured peering,

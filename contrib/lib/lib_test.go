@@ -2024,3 +2024,240 @@ func TestLateClientJoin(t *testing.T) {
 		t.Fatalf("TIMEOUT after %v (%d sends)", timeout, sendCount)
 	}
 }
+
+func TestInjectClientKey(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   string
+		want string // substring that must appear
+	}{
+		{
+			name: "quic URI gets password",
+			in:   "quic://1.2.3.4:5678",
+			want: "password=" + clientKey,
+		},
+		{
+			name: "tcp URI gets password",
+			in:   "tcp://example.com:9001",
+			want: "password=" + clientKey,
+		},
+		{
+			name: "existing password preserved",
+			in:   "quic://1.2.3.4:5678?password=custom",
+			want: "password=custom",
+		},
+		{
+			name: "empty string passthrough",
+			in:   "",
+			want: "",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := injectClientKey(tt.in)
+			if tt.want == "" {
+				if got != tt.in {
+					t.Errorf("injectClientKey(%q) = %q, want %q", tt.in, got, tt.in)
+				}
+				return
+			}
+			if !containsSubstr(got, tt.want) {
+				t.Errorf("injectClientKey(%q) = %q, does not contain %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInjectClientKeyDoesNotOverwrite(t *testing.T) {
+	uri := "quic://host:1234?password=mypassword"
+	got := injectClientKey(uri)
+	if containsSubstr(got, clientKey) {
+		t.Errorf("injectClientKey should not overwrite existing password, got %q", got)
+	}
+}
+
+func containsSubstr(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func TestClientKeyPasswordHandshake(t *testing.T) {
+	logger := testLogger()
+
+	cfgA, cfgB := config.GenerateConfig(), config.GenerateConfig()
+	if err := cfgA.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfgB.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeA, err := core.New(cfgA.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeA.Stop()
+
+	nodeB, err := core.New(cfgB.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeB.Stop()
+
+	// Node A listens with client key.
+	listenURI := injectClientKey("quic://localhost:0")
+	u, _ := url.Parse(listenURI)
+	listener, err := nodeA.Listen(u, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Node B connects with client key — should succeed.
+	peerURI := injectClientKey(fmt.Sprintf("quic://%s", listener.Addr().String()))
+	pu, _ := url.Parse(peerURI)
+	if err := nodeB.CallPeer(pu, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		peers := nodeA.GetPeers()
+		for _, p := range peers {
+			if p.Up && bytes.Equal(p.Key, nodeB.PublicKey()) {
+				return // success
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("nodes failed to peer with matching client key")
+}
+
+func TestClientKeyPasswordRejection(t *testing.T) {
+	logger := testLogger()
+
+	cfgA, cfgC := config.GenerateConfig(), config.GenerateConfig()
+	if err := cfgA.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfgC.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeA, err := core.New(cfgA.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeA.Stop()
+
+	nodeC, err := core.New(cfgC.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeC.Stop()
+
+	// Node A listens with client key.
+	listenURI := injectClientKey("quic://localhost:0")
+	u, _ := url.Parse(listenURI)
+	listener, err := nodeA.Listen(u, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Node C connects WITHOUT client key — should be rejected.
+	peerURI := fmt.Sprintf("quic://%s", listener.Addr().String())
+	pu, _ := url.Parse(peerURI)
+	_ = nodeC.CallPeer(pu, "")
+
+	// Wait and verify no peering established.
+	time.Sleep(3 * time.Second)
+	peers := nodeA.GetPeers()
+	for _, p := range peers {
+		if p.Up && bytes.Equal(p.Key, nodeC.PublicKey()) {
+			t.Fatal("node without client key should not be peered")
+		}
+	}
+}
+
+func TestAllowedPublicKeys(t *testing.T) {
+	logger := testLogger()
+
+	cfgA, cfgB, cfgC := config.GenerateConfig(), config.GenerateConfig(), config.GenerateConfig()
+	for _, cfg := range []*config.NodeConfig{cfgA, cfgB, cfgC} {
+		if err := cfg.GenerateSelfSignedCertificate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	nodeA, err := core.New(cfgA.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeA.Stop()
+
+	nodeB, err := core.New(cfgB.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeB.Stop()
+
+	nodeC, err := core.New(cfgC.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeC.Stop()
+
+	// Allow only nodeB's public key on nodeA.
+	nodeA.AllowPublicKey(nodeB.PublicKey())
+
+	// Node A listens with client key.
+	listenURI := injectClientKey("quic://localhost:0")
+	u, _ := url.Parse(listenURI)
+	listener, err := nodeA.Listen(u, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+
+	// Node B connects (allowed).
+	puB, _ := url.Parse(injectClientKey(fmt.Sprintf("quic://%s", addr)))
+	if err := nodeB.CallPeer(puB, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Node C connects (not allowed).
+	puC, _ := url.Parse(injectClientKey(fmt.Sprintf("quic://%s", addr)))
+	_ = nodeC.CallPeer(puC, "")
+
+	deadline := time.Now().Add(10 * time.Second)
+	bPeered := false
+	for time.Now().Before(deadline) {
+		peers := nodeA.GetPeers()
+		for _, p := range peers {
+			if p.Up && bytes.Equal(p.Key, nodeB.PublicKey()) {
+				bPeered = true
+			}
+			if p.Up && bytes.Equal(p.Key, nodeC.PublicKey()) {
+				t.Fatal("nodeC should not be peered (not in AllowedPublicKeys)")
+			}
+		}
+		if bPeered {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !bPeered {
+		t.Fatal("nodeB should have been peered (is in AllowedPublicKeys)")
+	}
+
+	// Verify nodeC is still not peered after extra wait.
+	time.Sleep(2 * time.Second)
+	peers := nodeA.GetPeers()
+	for _, p := range peers {
+		if p.Up && bytes.Equal(p.Key, nodeC.PublicKey()) {
+			t.Fatal("nodeC should not be peered after extra wait")
+		}
+	}
+}

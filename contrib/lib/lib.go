@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,7 @@ import (
 	iwt "github.com/Arceliar/ironwood/types"
 	"github.com/gologme/log"
 
+	"github.com/yggdrasil-network/yggdrasil-go/contrib/lib/holepunch"
 	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 	"github.com/yggdrasil-network/yggdrasil-go/src/config"
 	"github.com/yggdrasil-network/yggdrasil-go/src/core"
@@ -56,6 +58,9 @@ type yggNode struct {
 	dgBgOnce   sync.Once
 	config     *config.NodeConfig
 	multicast  *multicast.Multicast
+	holepunch  *holepunch.HolePunch
+	listener   *core.Listener // QUIC listener for incoming peer connections
+	listenPort int            // actual bound port of the QUIC listener
 	logger     *log.Logger
 	recvCh     chan recvPacket // background reader feeds this (lazy, started by ygg_recv_from)
 	dgRecvCh   chan recvPacket // datagram background reader feeds this
@@ -141,6 +146,28 @@ func (w *callbackWriter) Write(p []byte) (int, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Client key injection
+// ---------------------------------------------------------------------------
+
+// injectClientKey appends the something.chat client key password to a peer URI.
+// This ensures only something.chat nodes can complete the Yggdrasil handshake.
+func injectClientKey(rawURI string) string {
+	if rawURI == "" {
+		return rawURI
+	}
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return rawURI
+	}
+	q := u.Query()
+	if q.Get("password") == "" {
+		q.Set("password", clientKey)
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -176,6 +203,24 @@ func ygg_start(configJSON *C.char, logCb C.ygg_log_callback) C.int {
 		return -1
 	}
 	node.config.IfName = "none"
+
+	// Inject client key into all configured peers, listeners, and multicast interfaces
+	for i, peer := range node.config.Peers {
+		node.config.Peers[i] = injectClientKey(peer)
+	}
+	for intf, peers := range node.config.InterfacePeers {
+		for i, peer := range peers {
+			node.config.InterfacePeers[intf][i] = injectClientKey(peer)
+		}
+	}
+	for i, listen := range node.config.Listen {
+		node.config.Listen[i] = injectClientKey(listen)
+	}
+	for i := range node.config.MulticastInterfaces {
+		if node.config.MulticastInterfaces[i].Password == "" {
+			node.config.MulticastInterfaces[i].Password = clientKey
+		}
+	}
 
 	// Core options — mirrors contrib/mobile/mobile.go
 	iprange := net.IPNet{
@@ -249,6 +294,34 @@ func ygg_start(configJSON *C.char, logCb C.ygg_log_callback) C.int {
 		node.multicast, _ = multicast.New(node.core, node.logger, mcastOpts...)
 	}
 
+	// Start QUIC listener for incoming peer connections
+	listenURI, _ := url.Parse(injectClientKey("quic://[::]:0"))
+	listener, err := node.core.Listen(listenURI, "")
+	if err != nil {
+		logger.Warnln("Failed to start QUIC listener:", err)
+	} else {
+		node.listener = listener
+		_, portStr, _ := net.SplitHostPort(listener.Addr().String())
+		node.listenPort, _ = strconv.Atoi(portStr)
+		logger.Infof("QUIC listener on %s", listener.Addr())
+	}
+
+	// Hole punching (STUN + UPnP, uses Yggdrasil's listener port)
+	hp, err := holepunch.New(logger, node.listenPort)
+	if err != nil {
+		logger.Warnln("Failed to initialize hole punching:", err)
+	} else {
+		node.holepunch = hp
+		// Do an initial STUN discovery in the background.
+		go func() {
+			if result, err := hp.RefreshSTUN(); err != nil {
+				logger.Warnln("STUN discovery failed:", err)
+			} else {
+				logger.Infof("STUN discovered public address: %s", result)
+			}
+		}()
+	}
+
 	// I/O mode is chosen lazily on first use:
 	//   - ygg_send/ygg_recv use ipv6rwc (address-based, initialized by ensureIPRWC)
 	//   - ygg_send_to/ygg_recv_from use core directly (key-based, bg reader started by ensureBgReader)
@@ -267,6 +340,9 @@ func ygg_stop(handle C.int) C.int {
 	if node == nil {
 		setLastError(fmt.Errorf("invalid handle"))
 		return -1
+	}
+	if node.holepunch != nil {
+		_ = node.holepunch.Close()
 	}
 	if node.multicast != nil {
 		_ = node.multicast.Stop()
@@ -629,7 +705,7 @@ func ygg_add_peer(handle C.int, uri *C.char, sintf *C.char) C.int {
 		setLastError(fmt.Errorf("invalid handle"))
 		return -1
 	}
-	u, err := url.Parse(C.GoString(uri))
+	u, err := url.Parse(injectClientKey(C.GoString(uri)))
 	if err != nil {
 		setLastError(err)
 		return -1
@@ -684,7 +760,7 @@ func ygg_listen(handle C.int, uri *C.char) *C.char {
 		setLastError(fmt.Errorf("invalid handle"))
 		return nil
 	}
-	u, err := url.Parse(C.GoString(uri))
+	u, err := url.Parse(injectClientKey(C.GoString(uri)))
 	if err != nil {
 		setLastError(err)
 		return nil
@@ -698,6 +774,41 @@ func ygg_listen(handle C.int, uri *C.char) *C.char {
 	actualURI := u.Scheme + "://" + listener.Addr().String()
 	setLastError(nil)
 	return C.CString(actualURI)
+}
+
+//export ygg_get_listen_uri
+func ygg_get_listen_uri(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	if node.listener == nil {
+		return nil
+	}
+	uri := "quic://" + node.listener.Addr().String()
+	setLastError(nil)
+	return C.CString(uri)
+}
+
+//export ygg_stop_listen
+func ygg_stop_listen(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	if node.listener != nil {
+		node.listener.Cancel()
+		node.listener = nil
+		node.listenPort = 0
+	}
+	// Also disable UPnP — no point mapping a closed port
+	if node.holepunch != nil {
+		node.holepunch.DisableUPnP()
+	}
+	setLastError(nil)
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +1056,174 @@ func ygg_free_string(s *C.char) {
 	if s != nil {
 		C.free(unsafe.Pointer(s))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// AllowedPublicKeys management
+// ---------------------------------------------------------------------------
+
+//export ygg_allow_public_key
+func ygg_allow_public_key(handle C.int, keyHex *C.char) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	keyBytes, err := hex.DecodeString(C.GoString(keyHex))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	node.core.AllowPublicKey(keyBytes)
+	setLastError(nil)
+	return 0
+}
+
+//export ygg_disallow_public_key
+func ygg_disallow_public_key(handle C.int, keyHex *C.char) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	keyBytes, err := hex.DecodeString(C.GoString(keyHex))
+	if err != nil {
+		setLastError(err)
+		return -1
+	}
+	node.core.DisallowPublicKey(keyBytes)
+	setLastError(nil)
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Hole punching
+// ---------------------------------------------------------------------------
+
+//export ygg_refresh_stun
+func ygg_refresh_stun(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	if node.holepunch == nil {
+		setLastError(fmt.Errorf("holepunch not initialized"))
+		return nil
+	}
+	result, err := node.holepunch.RefreshSTUN()
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	setLastError(nil)
+	return C.CString(result.String())
+}
+
+//export ygg_get_candidates_json
+func ygg_get_candidates_json(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	if node.holepunch == nil {
+		setLastError(fmt.Errorf("holepunch not initialized"))
+		return nil
+	}
+	candidates := node.holepunch.GetCandidates()
+	data, err := holepunch.MarshalCandidates(candidates)
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	setLastError(nil)
+	return C.CString(data)
+}
+
+//export ygg_enable_upnp
+func ygg_enable_upnp(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	if node.holepunch == nil {
+		setLastError(fmt.Errorf("holepunch not initialized"))
+		return -1
+	}
+	if err := node.holepunch.EnableUPnP(); err != nil {
+		setLastError(err)
+		return -1
+	}
+	setLastError(nil)
+	if node.holepunch.UPnPEnabled() {
+		return 1 // mapping active
+	}
+	return 0 // no gateway found, not an error
+}
+
+//export ygg_disable_upnp
+func ygg_disable_upnp(handle C.int) C.int {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return -1
+	}
+	if node.holepunch == nil {
+		setLastError(fmt.Errorf("holepunch not initialized"))
+		return -1
+	}
+	node.holepunch.DisableUPnP()
+	setLastError(nil)
+	return 0
+}
+
+//export ygg_get_external_uri
+func ygg_get_external_uri(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	if node.holepunch == nil {
+		setLastError(fmt.Errorf("holepunch not initialized"))
+		return nil
+	}
+	uri := node.holepunch.ExternalURI()
+	setLastError(nil)
+	if uri == "" {
+		return nil
+	}
+	return C.CString(uri)
+}
+
+//export ygg_detect_nat
+func ygg_detect_nat(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	if node.holepunch == nil {
+		setLastError(fmt.Errorf("holepunch not initialized"))
+		return nil
+	}
+	info := node.holepunch.DetectNAT()
+	result := map[string]interface{}{
+		"type":    string(info.Type),
+		"details": info.Details,
+	}
+	if info.PublicAddr != nil {
+		result["publicAddr"] = info.PublicAddr.String()
+	}
+	data, err := json.Marshal(result)
+	if err != nil {
+		setLastError(err)
+		return nil
+	}
+	setLastError(nil)
+	return C.CString(string(data))
 }
 
 // ---------------------------------------------------------------------------
