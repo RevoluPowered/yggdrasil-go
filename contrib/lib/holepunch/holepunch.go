@@ -108,6 +108,17 @@ func (hp *HolePunch) ExternalURI() string {
 	return mapper.ExternalURI()
 }
 
+// ExternalTLSURI returns the UPnP-mapped TLS (TCP) URI, or "" if unavailable.
+func (hp *HolePunch) ExternalTLSURI() string {
+	hp.mu.RLock()
+	mapper := hp.natMapper
+	hp.mu.RUnlock()
+	if mapper == nil {
+		return ""
+	}
+	return mapper.ExternalTLSURI()
+}
+
 // Close releases the STUN UDP socket and any UPnP mappings.
 func (hp *HolePunch) Close() error {
 	hp.DisableUPnP()

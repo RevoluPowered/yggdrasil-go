@@ -163,6 +163,7 @@ func (m *NATMapper) mapPortUPnP() error {
 	}
 
 	port := uint16(m.localPort)
+	// Map UDP (QUIC)
 	err = m.upnpClient.AddPortMappingCtx(ctx,
 		"",          // remote host (any)
 		port,        // external port
@@ -170,11 +171,26 @@ func (m *NATMapper) mapPortUPnP() error {
 		port,        // internal port
 		localIP,     // internal client
 		true,        // enabled
-		m.description,
+		m.description+" UDP",
 		uint32(m.leaseSecs),
 	)
 	if err != nil {
-		return fmt.Errorf("add port mapping: %w", err)
+		return fmt.Errorf("add UDP port mapping: %w", err)
+	}
+	// Map TCP (TLS) on the same port
+	err = m.upnpClient.AddPortMappingCtx(ctx,
+		"",
+		port,
+		"TCP",
+		port,
+		localIP,
+		true,
+		m.description+" TCP",
+		uint32(m.leaseSecs),
+	)
+	if err != nil {
+		// TCP mapping failure is non-fatal — UDP still works
+		fmt.Printf("UPnP TCP mapping failed (non-fatal): %v\n", err)
 	}
 	m.mappedPort = int(port)
 	return nil
@@ -183,9 +199,12 @@ func (m *NATMapper) mapPortUPnP() error {
 func (m *NATMapper) mapPortPMP() error {
 	result, err := m.pmpClient.AddPortMapping("udp", m.localPort, m.localPort, m.leaseSecs)
 	if err != nil {
-		return fmt.Errorf("NAT-PMP add mapping: %w", err)
+		return fmt.Errorf("NAT-PMP add UDP mapping: %w", err)
 	}
 	m.mappedPort = int(result.MappedExternalPort)
+
+	// Also map TCP on the same port (non-fatal if it fails)
+	_, _ = m.pmpClient.AddPortMapping("tcp", m.localPort, m.localPort, m.leaseSecs)
 
 	// Get external IP.
 	extResult, err := m.pmpClient.GetExternalAddress()
@@ -225,6 +244,15 @@ func (m *NATMapper) ExternalURI() string {
 	return fmt.Sprintf("quic://%s", net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port)))
 }
 
+// ExternalTLSURI returns a TLS (TCP) URI for the mapped port, or "" if unmapped.
+func (m *NATMapper) ExternalTLSURI() string {
+	ip, port := m.ExternalAddr()
+	if ip == nil || port == 0 {
+		return ""
+	}
+	return fmt.Sprintf("tls://%s", net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port)))
+}
+
 // Stop releases the port mapping and stops the refresh goroutine.
 func (m *NATMapper) Stop() {
 	select {
@@ -242,10 +270,12 @@ func (m *NATMapper) Stop() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = m.upnpClient.DeletePortMappingCtx(ctx, "", uint16(m.mappedPort), "UDP")
+		_ = m.upnpClient.DeletePortMappingCtx(ctx, "", uint16(m.mappedPort), "TCP")
 	}
 	if m.pmpClient != nil && m.mappedPort > 0 {
 		// Mapping with lifetime 0 = delete.
 		_, _ = m.pmpClient.AddPortMapping("udp", m.localPort, 0, 0)
+		_, _ = m.pmpClient.AddPortMapping("tcp", m.localPort, 0, 0)
 	}
 	m.mappedPort = 0
 }
