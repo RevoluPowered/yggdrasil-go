@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/url"
 	"os"
@@ -2259,5 +2260,835 @@ func TestAllowedPublicKeys(t *testing.T) {
 		if p.Up && bytes.Equal(p.Key, nodeC.PublicKey()) {
 			t.Fatal("nodeC should not be peered after extra wait")
 		}
+	}
+}
+
+// udpProxy sits between two UDP endpoints and injects latency, jitter, and packet loss.
+// It uses two sockets: one facing the client, one facing the server.
+type pktLog struct {
+	t     time.Duration // relative to start
+	dir   string        // "C→S" or "S→C"
+	size  int
+}
+
+type udpProxy struct {
+	clientConn *net.UDPConn // proxy listens here (client connects to this)
+	serverConn *net.UDPConn // proxy uses this to talk to the real server
+	targetAddr *net.UDPAddr // the real server address
+
+	baseLatency time.Duration // one-way base latency
+	jitter      time.Duration // +/- random jitter on top of base
+	lossPercent int           // 0-100, percentage of packets to drop
+
+	mu         sync.Mutex
+	clientAddr *net.UDPAddr // learned from first client packet
+	closed     atomic.Bool
+
+	// Stats
+	c2sTotal   atomic.Int64
+	s2cTotal   atomic.Int64
+	c2sDropped atomic.Int64
+	s2cDropped atomic.Int64
+
+	logMu   sync.Mutex
+	logStart time.Time
+	logs    []pktLog
+	logging bool
+}
+
+func newUDPProxy(t *testing.T, targetAddr string, baseLatency, jitter time.Duration, lossPercent int) *udpProxy {
+	t.Helper()
+	target, err := net.ResolveUDPAddr("udp", targetAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &udpProxy{
+		clientConn:  clientConn,
+		serverConn:  serverConn,
+		targetAddr:  target,
+		baseLatency: baseLatency,
+		jitter:      jitter,
+		lossPercent: lossPercent,
+	}
+	go p.clientToServer()
+	go p.serverToClient()
+	return p
+}
+
+func (p *udpProxy) Addr() string {
+	return p.clientConn.LocalAddr().String()
+}
+
+func (p *udpProxy) Close() {
+	p.closed.Store(true)
+	p.clientConn.Close()
+	p.serverConn.Close()
+}
+
+func (p *udpProxy) shouldDrop() bool {
+	if p.lossPercent <= 0 {
+		return false
+	}
+	n, _ := rand.Int(rand.Reader, big.NewInt(100))
+	return int(n.Int64()) < p.lossPercent
+}
+
+func (p *udpProxy) delay() time.Duration {
+	d := p.baseLatency
+	if p.jitter > 0 {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(p.jitter*2)))
+		d += time.Duration(n.Int64()) - p.jitter
+		if d < 0 {
+			d = 0
+		}
+	}
+	return d
+}
+
+func (p *udpProxy) stats() (c2sTotal, c2sDropped, s2cTotal, s2cDropped int64) {
+	return p.c2sTotal.Load(), p.c2sDropped.Load(), p.s2cTotal.Load(), p.s2cDropped.Load()
+}
+
+func (p *udpProxy) resetStats() {
+	p.c2sTotal.Store(0)
+	p.c2sDropped.Store(0)
+	p.s2cTotal.Store(0)
+	p.s2cDropped.Store(0)
+}
+
+func (p *udpProxy) logPkt(dir string, size int) {
+	if !p.logging {
+		return
+	}
+	p.logMu.Lock()
+	p.logs = append(p.logs, pktLog{t: time.Since(p.logStart), dir: dir, size: size})
+	p.logMu.Unlock()
+}
+
+func (p *udpProxy) startLogging() {
+	p.logMu.Lock()
+	p.logStart = time.Now()
+	p.logs = nil
+	p.logging = true
+	p.logMu.Unlock()
+}
+
+func (p *udpProxy) dumpLogs(t *testing.T) {
+	p.logMu.Lock()
+	defer p.logMu.Unlock()
+	p.logging = false
+	t.Logf("=== Packet timeline (%d packets) ===", len(p.logs))
+	for _, l := range p.logs {
+		t.Logf("  %12v  %s  %d bytes", l.t.Round(time.Microsecond), l.dir, l.size)
+	}
+}
+
+// delayQueue delivers packets in order after a delay, using a single goroutine
+// with a timer instead of goroutine-per-packet (which causes reordering).
+type delayQueue struct {
+	ch     chan delayEntry
+	dst    *net.UDPConn
+	proxy  *udpProxy
+	dir    string
+	closed *atomic.Bool
+}
+
+type delayEntry struct {
+	data    []byte
+	addr    *net.UDPAddr
+	delivAt time.Time
+}
+
+func newDelayQueue(dst *net.UDPConn, proxy *udpProxy, dir string, closed *atomic.Bool) *delayQueue {
+	dq := &delayQueue{
+		ch:     make(chan delayEntry, 65536),
+		dst:    dst,
+		proxy:  proxy,
+		dir:    dir,
+		closed: closed,
+	}
+	go dq.run()
+	return dq
+}
+
+func (dq *delayQueue) send(data []byte, addr *net.UDPAddr, delay time.Duration) {
+	pkt := make([]byte, len(data))
+	copy(pkt, data)
+	select {
+	case dq.ch <- delayEntry{data: pkt, addr: addr, delivAt: time.Now().Add(delay)}:
+	default:
+		// queue full, drop
+	}
+}
+
+func (dq *delayQueue) run() {
+	for e := range dq.ch {
+		if dq.closed.Load() {
+			return
+		}
+		if wait := time.Until(e.delivAt); wait > 0 {
+			time.Sleep(wait)
+		}
+		if !dq.closed.Load() {
+			dq.proxy.logPkt(dq.dir, len(e.data))
+			dq.dst.WriteToUDP(e.data, e.addr)
+		}
+	}
+}
+
+// clientToServer reads from the client-facing socket and forwards to the server.
+func (p *udpProxy) clientToServer() {
+	dq := newDelayQueue(p.serverConn, p, "C→S", &p.closed)
+	buf := make([]byte, 65536)
+	for {
+		if p.closed.Load() {
+			close(dq.ch)
+			return
+		}
+		n, srcAddr, err := p.clientConn.ReadFromUDP(buf)
+		if err != nil {
+			close(dq.ch)
+			return
+		}
+		p.mu.Lock()
+		p.clientAddr = srcAddr
+		p.mu.Unlock()
+
+		p.c2sTotal.Add(1)
+		if p.shouldDrop() {
+			p.c2sDropped.Add(1)
+			continue
+		}
+		dq.send(buf[:n], p.targetAddr, p.delay())
+	}
+}
+
+// serverToClient reads responses from the server and forwards back to the client.
+func (p *udpProxy) serverToClient() {
+	dq := newDelayQueue(p.clientConn, p, "S→C", &p.closed)
+	buf := make([]byte, 65536)
+	for {
+		if p.closed.Load() {
+			close(dq.ch)
+			return
+		}
+		n, _, err := p.serverConn.ReadFromUDP(buf)
+		if err != nil {
+			close(dq.ch)
+			return
+		}
+		p.mu.Lock()
+		client := p.clientAddr
+		p.mu.Unlock()
+		if client == nil {
+			continue
+		}
+		p.s2cTotal.Add(1)
+		if p.shouldDrop() {
+			p.s2cDropped.Add(1)
+			continue
+		}
+		dq.send(buf[:n], client, p.delay())
+	}
+}
+
+// createConnectedPairViaProxy creates two nodes connected through a UDP proxy
+// that simulates network impairment (latency, jitter, packet loss).
+func createConnectedPairViaProxy(t *testing.T, baseLatency, jitter time.Duration, lossPercent int) (*core.Core, *core.Core, *udpProxy) {
+	t.Helper()
+	logger := testLogger()
+
+	cfgA, cfgB := config.GenerateConfig(), config.GenerateConfig()
+	if err := cfgA.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfgB.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeA, err := core.New(cfgA.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeB, err := core.New(cfgB.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// nodeA listens on QUIC
+	u, _ := url.Parse("quic://localhost:0")
+	listener, err := nodeA.Listen(u, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create proxy pointing to nodeA's listener
+	proxy := newUDPProxy(t, listener.Addr().String(), baseLatency, jitter, lossPercent)
+
+	// nodeB connects through the proxy
+	peerURL, _ := url.Parse("quic://" + proxy.Addr())
+	if err := nodeB.CallPeer(peerURL, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for tree convergence
+	for i := 0; i < 100; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if len(nodeA.GetTree()) > 1 && len(nodeB.GetTree()) > 1 {
+			time.Sleep(3 * time.Second)
+			return nodeA, nodeB, proxy
+		}
+	}
+	t.Fatal("nodes did not connect through proxy")
+	return nil, nil, nil
+}
+
+// TestThroughputWithNetworkImpairment measures throughput under various simulated
+// network conditions with packet loss tracking to avoid chasing test artifacts.
+func TestThroughputWithNetworkImpairment(t *testing.T) {
+	const packetSize = 60_000
+	const totalSize = 1_000_000 // 1 MB
+
+	type scenario struct {
+		name        string
+		latency     time.Duration // one-way base latency
+		jitter      time.Duration // +/- jitter
+		lossPercent int           // packet loss %
+	}
+
+	type result struct {
+		name       string
+		mbps       float64
+		elapsed    time.Duration
+		c2sTotal   int64
+		c2sDropped int64
+		s2cTotal   int64
+		s2cDropped int64
+	}
+	var results []result
+
+	scenarios := []scenario{
+		// Baseline
+		{"baseline (no impairment)", 0, 0, 0},
+		// Latency sweep
+		{"10ms latency", 10 * time.Millisecond, 0, 0},
+		{"25ms latency", 25 * time.Millisecond, 0, 0},
+		{"50ms latency", 50 * time.Millisecond, 0, 0},
+		{"100ms latency", 100 * time.Millisecond, 0, 0},
+		// Jitter
+		{"25ms latency + 10ms jitter", 25 * time.Millisecond, 10 * time.Millisecond, 0},
+		{"25ms latency + 25ms jitter", 25 * time.Millisecond, 25 * time.Millisecond, 0},
+		// Packet loss
+		{"25ms latency + 0.5% loss", 25 * time.Millisecond, 0, 1},
+		{"25ms latency + 2% loss", 25 * time.Millisecond, 0, 2},
+		{"25ms latency + 5% loss", 25 * time.Millisecond, 0, 5},
+		// Realistic combos
+		{"5G good (10ms+5ms jitter)", 10 * time.Millisecond, 5 * time.Millisecond, 0},
+		{"5G typical (25ms+15ms jitter+0.5% loss)", 25 * time.Millisecond, 15 * time.Millisecond, 1},
+		{"5G poor (50ms+30ms jitter+2% loss)", 50 * time.Millisecond, 30 * time.Millisecond, 2},
+		{"satellite (300ms+50ms jitter+1% loss)", 300 * time.Millisecond, 50 * time.Millisecond, 1},
+	}
+
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			nodeA, nodeB, proxy := createConnectedPairViaProxy(t, sc.latency, sc.jitter, sc.lossPercent)
+			defer nodeA.Stop()
+			defer nodeB.Stop()
+			defer proxy.Close()
+
+			numPackets := totalSize / packetSize
+			proxy.resetStats()
+
+			// B needs a read loop for session acks
+			go func() {
+				buf := make([]byte, packetSize)
+				for {
+					if _, _, err := nodeB.ReadFrom(buf); err != nil {
+						return
+					}
+				}
+			}()
+
+			msg := make([]byte, packetSize)
+			rand.Read(msg[40:])
+			msg[0] = 0x60
+			copy(msg[8:24], nodeB.Address())
+			copy(msg[24:40], nodeA.Address())
+			addr := nodeA.LocalAddr()
+
+			// Warmup
+			nodeB.WriteTo(msg, addr)
+			warmupBuf := make([]byte, packetSize)
+			if _, _, err := nodeA.ReadFrom(warmupBuf); err != nil {
+				t.Fatalf("warmup ReadFrom: %v", err)
+			}
+
+			// Receiver on A
+			var recvCount atomic.Int64
+			recvDone := make(chan struct{})
+			go func() {
+				buf := make([]byte, packetSize)
+				for i := 0; i < numPackets; i++ {
+					if _, _, err := nodeA.ReadFrom(buf); err != nil {
+						return
+					}
+					recvCount.Add(1)
+				}
+				close(recvDone)
+			}()
+
+			// Sender on B
+			start := time.Now()
+			for i := 0; i < numPackets; i++ {
+				if _, err := nodeB.WriteTo(msg, addr); err != nil {
+					t.Fatalf("WriteTo %d: %v", i, err)
+				}
+			}
+
+			select {
+			case <-recvDone:
+			case <-time.After(5 * time.Minute):
+				t.Fatalf("timeout: received %d/%d packets", recvCount.Load(), numPackets)
+			}
+			elapsed := time.Since(start)
+
+			totalBytes := int64(packetSize) * int64(numPackets)
+			mbps := float64(totalBytes) / elapsed.Seconds() / 1_000_000
+			c2sT, c2sD, s2cT, s2cD := proxy.stats()
+			results = append(results, result{sc.name, mbps, elapsed, c2sT, c2sD, s2cT, s2cD})
+			t.Logf("%d packets in %v (%.2f MB/s) | UDP: C→S %d/%d dropped, S→C %d/%d dropped",
+				numPackets, elapsed, mbps, c2sD, c2sT, s2cD, s2cT)
+		})
+	}
+
+	fmt.Printf("\n  Throughput Under Network Impairment:\n")
+	fmt.Printf("  %-48s %10s %10s %18s %18s\n", "Scenario", "Time", "Rate", "C→S loss", "S→C loss")
+	fmt.Printf("  %-48s %10s %10s %18s %18s\n", "--------", "----", "----", "--------", "--------")
+	for _, r := range results {
+		c2sLoss := "0%"
+		s2cLoss := "0%"
+		if r.c2sTotal > 0 {
+			c2sLoss = fmt.Sprintf("%d/%d (%.1f%%)", r.c2sDropped, r.c2sTotal, float64(r.c2sDropped)/float64(r.c2sTotal)*100)
+		}
+		if r.s2cTotal > 0 {
+			s2cLoss = fmt.Sprintf("%d/%d (%.1f%%)", r.s2cDropped, r.s2cTotal, float64(r.s2cDropped)/float64(r.s2cTotal)*100)
+		}
+		fmt.Printf("  %-48s %10v %8.2f MB/s %18s %18s\n", r.name, r.elapsed.Round(time.Millisecond), r.mbps, c2sLoss, s2cLoss)
+	}
+	fmt.Println()
+}
+
+// TestReliableDeliveryWithPacketLoss verifies that QUIC retransmission ensures
+// all ironwood packets arrive despite UDP-level packet loss.
+func TestReliableDeliveryWithPacketLoss(t *testing.T) {
+	const packetSize = 60_000
+	const numPackets = 100 // 6 MB total
+
+	type scenario struct {
+		name        string
+		latency     time.Duration
+		lossPercent int
+	}
+
+	scenarios := []scenario{
+		{"1% loss, 25ms latency", 25 * time.Millisecond, 1},
+		{"5% loss, 25ms latency", 25 * time.Millisecond, 5},
+		{"10% loss, 25ms latency", 25 * time.Millisecond, 10},
+		{"5% loss, 100ms latency", 100 * time.Millisecond, 5},
+	}
+
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			nodeA, nodeB, proxy := createConnectedPairViaProxy(t, sc.latency, 0, sc.lossPercent)
+			defer nodeA.Stop()
+			defer nodeB.Stop()
+			defer proxy.Close()
+
+			// B needs a read loop for session acks
+			go func() {
+				buf := make([]byte, packetSize)
+				for {
+					if _, _, err := nodeB.ReadFrom(buf); err != nil {
+						return
+					}
+				}
+			}()
+
+			// Build unique packets so we can verify content
+			msgs := make([][]byte, numPackets)
+			for i := range msgs {
+				msgs[i] = make([]byte, packetSize)
+				rand.Read(msgs[i][40:])
+				msgs[i][0] = 0x60
+				copy(msgs[i][8:24], nodeB.Address())
+				copy(msgs[i][24:40], nodeA.Address())
+				// Tag each packet with its index
+				msgs[i][40] = byte(i >> 8)
+				msgs[i][41] = byte(i)
+			}
+			addr := nodeA.LocalAddr()
+
+			// Warmup
+			nodeB.WriteTo(msgs[0], addr)
+			warmupBuf := make([]byte, packetSize)
+			if _, _, err := nodeA.ReadFrom(warmupBuf); err != nil {
+				t.Fatalf("warmup ReadFrom: %v", err)
+			}
+
+			// Receiver on A — collect all packets
+			received := make([]bool, numPackets)
+			var recvCount atomic.Int64
+			recvDone := make(chan struct{})
+			go func() {
+				buf := make([]byte, packetSize)
+				for i := 0; i < numPackets; i++ {
+					n, _, err := nodeA.ReadFrom(buf)
+					if err != nil {
+						return
+					}
+					if n >= 42 {
+						idx := int(buf[40])<<8 | int(buf[41])
+						if idx >= 0 && idx < numPackets {
+							received[idx] = true
+						}
+					}
+					recvCount.Add(1)
+				}
+				close(recvDone)
+			}()
+
+			// Send all packets
+			start := time.Now()
+			for i := 0; i < numPackets; i++ {
+				if _, err := nodeB.WriteTo(msgs[i], addr); err != nil {
+					t.Fatalf("WriteTo %d: %v", i, err)
+				}
+			}
+
+			select {
+			case <-recvDone:
+			case <-time.After(5 * time.Minute):
+				t.Fatalf("timeout: received %d/%d packets", recvCount.Load(), numPackets)
+			}
+			elapsed := time.Since(start)
+
+			// Verify all packets arrived
+			missing := 0
+			for i, got := range received {
+				if !got {
+					missing++
+					if missing <= 5 {
+						t.Errorf("packet %d missing", i)
+					}
+				}
+			}
+			if missing > 0 {
+				t.Fatalf("%d/%d packets missing", missing, numPackets)
+			}
+
+			totalBytes := int64(packetSize) * int64(numPackets)
+			mbps := float64(totalBytes) / elapsed.Seconds() / 1_000_000
+			t.Logf("PASS: %d/%d packets delivered in %v (%.2f MB/s) with %d%% loss",
+				numPackets, numPackets, elapsed.Round(time.Millisecond), mbps, sc.lossPercent)
+		})
+	}
+}
+
+// tcpProxy sits between two TCP endpoints and injects latency and jitter.
+type tcpProxy struct {
+	listener    net.Listener
+	baseLatency time.Duration
+	jitter      time.Duration
+	closed      atomic.Bool
+}
+
+func newTCPProxy(t *testing.T, targetAddr string, baseLatency, jitter time.Duration) *tcpProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &tcpProxy{
+		listener:    ln,
+		baseLatency: baseLatency,
+		jitter:      jitter,
+	}
+	go func() {
+		for {
+			clientConn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			serverConn, err := net.Dial("tcp", targetAddr)
+			if err != nil {
+				clientConn.Close()
+				continue
+			}
+			go p.pipe(clientConn, serverConn)
+			go p.pipe(serverConn, clientConn)
+		}
+	}()
+	return p
+}
+
+func (p *tcpProxy) Addr() string {
+	return p.listener.Addr().String()
+}
+
+func (p *tcpProxy) Close() {
+	p.closed.Store(true)
+	p.listener.Close()
+}
+
+func (p *tcpProxy) pipe(src, dst net.Conn) {
+	// Use a buffered channel to serialize delayed writes while allowing reads to continue.
+	type chunk struct {
+		data []byte
+		at   time.Time // when to deliver
+	}
+	ch := make(chan chunk, 1024)
+
+	// Writer goroutine: delivers chunks at scheduled times.
+	go func() {
+		for c := range ch {
+			if delay := time.Until(c.at); delay > 0 {
+				time.Sleep(delay)
+			}
+			if _, err := dst.Write(c.data); err != nil {
+				src.Close()
+				dst.Close()
+				return
+			}
+		}
+	}()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if err != nil || p.closed.Load() {
+			close(ch)
+			src.Close()
+			dst.Close()
+			return
+		}
+		d := p.baseLatency
+		if p.jitter > 0 {
+			jn, _ := rand.Int(rand.Reader, big.NewInt(int64(p.jitter*2)))
+			d += time.Duration(jn.Int64()) - p.jitter
+			if d < 0 {
+				d = 0
+			}
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		ch <- chunk{data: pkt, at: time.Now().Add(d)}
+	}
+}
+
+// createConnectedPairViaTCPProxy creates two nodes connected via TCP through a latency proxy.
+func createConnectedPairViaTCPProxy(t *testing.T, baseLatency, jitter time.Duration) (*core.Core, *core.Core, *tcpProxy) {
+	t.Helper()
+	logger := testLogger()
+
+	cfgA, cfgB := config.GenerateConfig(), config.GenerateConfig()
+	if err := cfgA.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfgB.GenerateSelfSignedCertificate(); err != nil {
+		t.Fatal(err)
+	}
+
+	nodeA, err := core.New(cfgA.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeB, err := core.New(cfgB.Certificate, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, _ := url.Parse("tcp://localhost:0")
+	listener, err := nodeA.Listen(u, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := newTCPProxy(t, listener.Addr().String(), baseLatency, jitter)
+
+	peerURL, _ := url.Parse("tcp://" + proxy.Addr())
+	if err := nodeB.CallPeer(peerURL, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 100; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if len(nodeA.GetTree()) > 1 && len(nodeB.GetTree()) > 1 {
+			time.Sleep(3 * time.Second)
+			return nodeA, nodeB, proxy
+		}
+	}
+	t.Fatal("nodes did not connect through TCP proxy")
+	return nil, nil, nil
+}
+
+// TestThroughputTCPvsQUIC compares throughput over TCP vs QUIC under latency.
+// TCP has its own congestion control (kernel Cubic) — if ironwood is the bottleneck,
+// both will be equally slow. If QUIC Cubic is the bottleneck, TCP will be faster.
+func TestThroughputTCPvsQUIC(t *testing.T) {
+	const packetSize = 60_000
+	const totalSize = 1_000_000 // 1 MB
+	const latency = 25 * time.Millisecond
+
+	type result struct {
+		name    string
+		mbps    float64
+		elapsed time.Duration
+	}
+	var results []result
+
+	runTest := func(name string, nodeA, nodeB *core.Core) {
+		numPackets := totalSize / packetSize
+
+		go func() {
+			buf := make([]byte, packetSize)
+			for {
+				if _, _, err := nodeB.ReadFrom(buf); err != nil {
+					return
+				}
+			}
+		}()
+
+		msg := make([]byte, packetSize)
+		rand.Read(msg[40:])
+		msg[0] = 0x60
+		copy(msg[8:24], nodeB.Address())
+		copy(msg[24:40], nodeA.Address())
+		addr := nodeA.LocalAddr()
+
+		nodeB.WriteTo(msg, addr)
+		warmupBuf := make([]byte, packetSize)
+		if _, _, err := nodeA.ReadFrom(warmupBuf); err != nil {
+			t.Fatalf("warmup ReadFrom: %v", err)
+		}
+
+		var recvCount atomic.Int64
+		recvDone := make(chan struct{})
+		go func() {
+			buf := make([]byte, packetSize)
+			for i := 0; i < numPackets; i++ {
+				if _, _, err := nodeA.ReadFrom(buf); err != nil {
+					return
+				}
+				recvCount.Add(1)
+			}
+			close(recvDone)
+		}()
+
+		start := time.Now()
+		for i := 0; i < numPackets; i++ {
+			if _, err := nodeB.WriteTo(msg, addr); err != nil {
+				t.Fatalf("WriteTo %d: %v", i, err)
+			}
+		}
+
+		select {
+		case <-recvDone:
+		case <-time.After(5 * time.Minute):
+			t.Fatalf("timeout: received %d/%d packets", recvCount.Load(), numPackets)
+		}
+		elapsed := time.Since(start)
+
+		totalBytes := int64(packetSize) * int64(numPackets)
+		mbps := float64(totalBytes) / elapsed.Seconds() / 1_000_000
+		results = append(results, result{name, mbps, elapsed})
+		t.Logf("%s: %d packets in %v (%.2f MB/s)", name, numPackets, elapsed, mbps)
+	}
+
+	t.Run("QUIC with 25ms latency", func(t *testing.T) {
+		nodeA, nodeB, proxy := createConnectedPairViaProxy(t, latency, 0, 0)
+		defer nodeA.Stop()
+		defer nodeB.Stop()
+		defer proxy.Close()
+		runTest("QUIC", nodeA, nodeB)
+	})
+
+	t.Run("TCP with 25ms latency", func(t *testing.T) {
+		nodeA, nodeB, proxy := createConnectedPairViaTCPProxy(t, latency, 0)
+		defer nodeA.Stop()
+		defer nodeB.Stop()
+		defer proxy.Close()
+		runTest("TCP", nodeA, nodeB)
+	})
+
+	fmt.Printf("\n  TCP (25ms one-way latency, 100 MB transfer):\n")
+	fmt.Printf("  %-30s %12s %12s\n", "Transport", "Time", "Rate")
+	fmt.Printf("  %-30s %12s %12s\n", "---------", "----", "----")
+	for _, r := range results {
+		fmt.Printf("  %-30s %12v %10.2f MB/s\n", r.name, r.elapsed.Round(time.Millisecond), r.mbps)
+	}
+	fmt.Println()
+}
+
+// TestRawTCPBaseline measures raw TCP throughput through the same TCP proxy
+// with 25ms latency — no ironwood, no yggdrasil. This isolates whether the
+// proxy + latency alone explains the throughput drop, or if ironwood is the cause.
+func TestRawTCPBaseline(t *testing.T) {
+	const totalSize = 1_000_000
+	const chunkSize = 60_000
+	const latency = 25 * time.Millisecond
+
+	numChunks := totalSize / chunkSize
+	actualSize := int64(numChunks * chunkSize)
+
+	// Server: accepts and drains
+	serverLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverLn.Close()
+
+	recvDone := make(chan int64)
+	go func() {
+		conn, err := serverLn.Accept()
+		if err != nil {
+			recvDone <- 0
+			return
+		}
+		defer conn.Close()
+		total, _ := io.Copy(io.Discard, io.LimitReader(conn, actualSize))
+		recvDone <- total
+	}()
+
+	conn, err := net.Dial("tcp", serverLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	payload := make([]byte, chunkSize)
+	rand.Read(payload)
+
+	start := time.Now()
+	for i := 0; i < numChunks; i++ {
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+
+	select {
+	case total := <-recvDone:
+		elapsed := time.Since(start)
+		mbps := float64(total) / elapsed.Seconds() / 1_000_000
+		t.Logf("Raw TCP localhost (no proxy): %d bytes in %v (%.2f MB/s)", total, elapsed, mbps)
+	case <-time.After(30 * time.Second):
+		t.Fatalf("timeout")
 	}
 }
