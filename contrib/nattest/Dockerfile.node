@@ -1,0 +1,10 @@
+FROM golang:1.26-alpine AS builder
+RUN apk add --no-cache git
+COPY . /src
+WORKDIR /src
+RUN CGO_ENABLED=0 go build -o /nattest ./contrib/nattest/cmd/nattest/
+
+FROM alpine:latest
+RUN apk add --no-cache iproute2
+COPY --from=builder /nattest /usr/bin/nattest
+ENTRYPOINT ["/usr/bin/nattest"]

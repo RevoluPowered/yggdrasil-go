@@ -1,0 +1,151 @@
+networks:
+  internet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  cone-lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.1.0.0/24
+  sym-lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.2.0.0/24
+  udpblock-lan:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.3.0.0/24
+
+volumes:
+  peerinfo:
+
+services:
+  # === ROUTERS ===
+
+  cone-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.router
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      - internet
+      - cone-lan
+    environment:
+      - NAT_TYPE=cone
+      - WAN_SUBNET=172.30.
+      - LAN_SUBNET=10.1.
+
+  sym-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.router
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      - internet
+      - sym-lan
+    environment:
+      - NAT_TYPE=symmetric
+      - WAN_SUBNET=172.30.
+      - LAN_SUBNET=10.2.
+
+  udpblock-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.router
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      - internet
+      - udpblock-lan
+    environment:
+      - NAT_TYPE=udpblock
+      - WAN_SUBNET=172.30.
+      - LAN_SUBNET=10.3.
+
+  # === NODES ===
+
+  public-node:
+    build:
+      context: ../..
+      dockerfile: contrib/nattest/Dockerfile.node
+    networks:
+      - internet
+    environment:
+      - NODE_ROLE=public
+      - LISTEN_PORT=27500
+      - EXPECTED_NODES=4
+      - MY_SUBNET=172.30.
+    volumes:
+      - peerinfo:/peerinfo
+
+  cone-node:
+    build:
+      context: ../..
+      dockerfile: contrib/nattest/Dockerfile.node
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - cone-lan
+    environment:
+      - NODE_ROLE=cone
+      - LISTEN_PORT=27500
+      - EXPECTED_NODES=4
+      - MY_SUBNET=10.1.
+      - GATEWAY_SUBNET=10.1.
+    volumes:
+      - peerinfo:/peerinfo
+    depends_on:
+      - cone-router
+
+  sym-node:
+    build:
+      context: ../..
+      dockerfile: contrib/nattest/Dockerfile.node
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - sym-lan
+    environment:
+      - NODE_ROLE=symmetric
+      - LISTEN_PORT=27500
+      - EXPECTED_NODES=4
+      - MY_SUBNET=10.2.
+      - GATEWAY_SUBNET=10.2.
+    volumes:
+      - peerinfo:/peerinfo
+    depends_on:
+      - sym-router
+
+  udpblock-node:
+    build:
+      context: ../..
+      dockerfile: contrib/nattest/Dockerfile.node
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - udpblock-lan
+    environment:
+      - NODE_ROLE=udpblock
+      - LISTEN_PORT=27500
+      - EXPECTED_NODES=4
+      - MY_SUBNET=10.3.
+      - GATEWAY_SUBNET=10.3.
+    volumes:
+      - peerinfo:/peerinfo
+    depends_on:
+      - udpblock-router

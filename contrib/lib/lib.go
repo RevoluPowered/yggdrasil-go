@@ -21,12 +21,16 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 
 	iwenc "github.com/Arceliar/ironwood/encrypted"
 	iwt "github.com/Arceliar/ironwood/types"
@@ -59,8 +63,9 @@ type yggNode struct {
 	config     *config.NodeConfig
 	multicast  *multicast.Multicast
 	holepunch  *holepunch.HolePunch
-	listener   *core.Listener // QUIC listener for incoming peer connections
-	listenPort int            // actual bound port of the QUIC listener
+	listener    *core.Listener // QUIC listener for incoming peer connections
+	tlsListener *core.Listener // TLS (TCP) listener for incoming peer connections
+	listenPort  int            // actual bound port of the QUIC+TLS listeners
 	logger     *log.Logger
 	recvCh     chan recvPacket // background reader feeds this (lazy, started by ygg_recv_from)
 	dgRecvCh   chan recvPacket // datagram background reader feeds this
@@ -165,6 +170,31 @@ func injectClientKey(rawURI string) string {
 		u.RawQuery = q.Encode()
 	}
 	return u.String()
+}
+
+// ---------------------------------------------------------------------------
+// Crash log — redirect stderr so Go panics are captured to a file
+// ---------------------------------------------------------------------------
+
+var crashLogFile *os.File
+var origStderr = os.Stderr // prevent GC from finalizing the original fd 2
+
+//export ygg_set_crash_log
+func ygg_set_crash_log(path *C.char) C.int {
+	goPath := C.GoString(path)
+	f, err := os.OpenFile(goPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return -1
+	}
+	// Redirect fd 2 (stderr) to the file so that runtime.raise / SIGABRT
+	// crash output lands on disk. dup3 works on arm64 (dup2 does not).
+	_ = unix.Dup2(int(f.Fd()), 2)
+	// Also use SetCrashOutput as a belt-and-suspenders measure
+	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
+	crashLogFile = f
+	// Ensure full goroutine dumps on crash
+	debug.SetTraceback("system")
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -295,15 +325,42 @@ func ygg_start(configJSON *C.char, logCb C.ygg_log_callback) C.int {
 	}
 
 	// Start QUIC listener for incoming peer connections
-	listenURI, _ := url.Parse(injectClientKey("quic://[::]:0"))
-	listener, err := node.core.Listen(listenURI, "")
-	if err != nil {
-		logger.Warnln("Failed to start QUIC listener:", err)
-	} else {
+	// Try ports in the 27000-28000 range (game traffic, VPN-friendly)
+	var listener *core.Listener
+	for port := 27000; port <= 28000; port++ {
+		uri, _ := url.Parse(injectClientKey(fmt.Sprintf("quic://[::]:%d", port)))
+		l, err := node.core.Listen(uri, "")
+		if err == nil {
+			listener = l
+			break
+		}
+	}
+	if listener == nil {
+		// Fallback to random port
+		fallbackURI, _ := url.Parse(injectClientKey("quic://[::]:0"))
+		var err error
+		listener, err = node.core.Listen(fallbackURI, "")
+		if err != nil {
+			logger.Warnln("Failed to start QUIC listener:", err)
+		}
+	}
+	if listener != nil {
 		node.listener = listener
 		_, portStr, _ := net.SplitHostPort(listener.Addr().String())
 		node.listenPort, _ = strconv.Atoi(portStr)
 		logger.Infof("QUIC listener on %s", listener.Addr())
+	}
+
+	// Start TLS (TCP) listener on the same port for VPN/firewall compatibility
+	if node.listenPort > 0 {
+		tlsURI, _ := url.Parse(injectClientKey(fmt.Sprintf("tls://[::]:%d", node.listenPort)))
+		tlsListener, err := node.core.Listen(tlsURI, "")
+		if err != nil {
+			logger.Warnln("Failed to start TLS listener:", err)
+		} else {
+			node.tlsListener = tlsListener
+			logger.Infof("TLS listener on %s", tlsListener.Addr())
+		}
 	}
 
 	// Hole punching (STUN + UPnP, uses Yggdrasil's listener port)
@@ -1191,6 +1248,25 @@ func ygg_get_external_uri(handle C.int) *C.char {
 		return nil
 	}
 	uri := node.holepunch.ExternalURI()
+	setLastError(nil)
+	if uri == "" {
+		return nil
+	}
+	return C.CString(uri)
+}
+
+//export ygg_get_external_tls_uri
+func ygg_get_external_tls_uri(handle C.int) *C.char {
+	node := getNode(handle)
+	if node == nil {
+		setLastError(fmt.Errorf("invalid handle"))
+		return nil
+	}
+	if node.holepunch == nil {
+		setLastError(fmt.Errorf("holepunch not initialized"))
+		return nil
+	}
+	uri := node.holepunch.ExternalTLSURI()
 	setLastError(nil)
 	if uri == "" {
 		return nil
