@@ -252,11 +252,13 @@ func (m *Multicast) _announce() {
 	m._updateInterfaces()
 	groupAddr, err := net.ResolveUDPAddr("udp6", string(m.config._groupAddr))
 	if err != nil {
-		panic(err)
+		m.log.Errorln("Failed to resolve multicast group address:", err)
+		return
 	}
 	destAddr, err := net.ResolveUDPAddr("udp6", string(m.config._groupAddr))
 	if err != nil {
-		panic(err)
+		m.log.Errorln("Failed to resolve multicast dest address:", err)
+		return
 	}
 	// There might be interfaces that we configured listeners for but are no
 	// longer up - if that's the case then we should stop the listeners
@@ -380,8 +382,11 @@ func (m *Multicast) _announce() {
 func (m *Multicast) listen() {
 	groupAddr, err := net.ResolveUDPAddr("udp6", string(m.config._groupAddr))
 	if err != nil {
-		panic(err)
+		m.log.Errorln("Failed to resolve multicast group address:", err)
+		return
 	}
+	const maxListenErrors = 10
+	var listenErrors int
 	bs := make([]byte, 2048)
 	hb := make([]byte, 0, blake2b.Size) // Reused to reduce hash allocations
 	for {
@@ -393,8 +398,20 @@ func (m *Multicast) listen() {
 			if !m.IsStarted() {
 				return
 			}
-			panic(err)
+			listenErrors++
+			m.log.Warnf("Multicast listen error (%d/%d): %s", listenErrors, maxListenErrors, err)
+			if listenErrors >= maxListenErrors {
+				m.log.Warnln("Multicast listener restarting after too many errors")
+				m.Act(nil, func() {
+					_ = m._stop()
+					_ = m._start()
+				})
+				return
+			}
+			time.Sleep(time.Second)
+			continue
 		}
+		listenErrors = 0
 		if rcm != nil {
 			// Windows can't set the flag needed to return a non-nil value here
 			// So only make these checks if we get something useful back
