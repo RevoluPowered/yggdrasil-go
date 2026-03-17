@@ -121,6 +121,8 @@ func New(cert *tls.Certificate, logger Logger, opts ...SetupOption) (*Core, erro
 		iwn.WithPathNotify(c.doPathNotify),
 		iwn.WithPeerQueueTimeout(5*time.Second),
 		iwn.WithCipherMode(iwn.CipherAESGCM),
+		iwn.WithPeerMaxQueueSize(64*1024*1024), // 64MB — better for high-latency links
+		iwn.WithMaxInflightWrites(1024),         // 1024 in-flight (was 256)
 	); err != nil {
 		return nil, fmt.Errorf("error creating encryption: %w", err)
 	}
