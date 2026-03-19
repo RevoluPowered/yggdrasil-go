@@ -40,6 +40,7 @@ type links struct {
 	quic  *linkQUIC  // QUIC interface support
 	ws    *linkWS    // WS interface support
 	wss   *linkWSS   // WSS interface support
+	wt    *linkWT    // WebTransport interface support
 	// _links can only be modified safely from within the links actor
 	_links     map[linkInfo]*link // *link is nil if connection in progress
 	_listeners map[*Listener]context.CancelFunc
@@ -96,6 +97,7 @@ func (l *links) init(c *Core) error {
 	l.quic = l.newLinkQUIC()
 	l.ws = l.newLinkWS()
 	l.wss = l.newLinkWSS()
+	l.wt = l.newLinkWT()
 	l._links = make(map[linkInfo]*link)
 	l._listeners = make(map[*Listener]context.CancelFunc)
 
@@ -458,6 +460,8 @@ func (l *links) listen(u *url.URL, sintf string, local bool) (*Listener, error) 
 		protocol = l.ws
 	case "wss":
 		protocol = l.wss
+	case "wts":
+		protocol = l.wt
 	default:
 		ctxcancel()
 		return nil, ErrLinkUnrecognisedSchema
@@ -609,6 +613,8 @@ func (l *links) connect(ctx context.Context, u *url.URL, info linkInfo, options 
 		dialer = l.ws
 	case "wss":
 		dialer = l.wss
+	case "wts":
+		dialer = l.wt
 	default:
 		return nil, ErrLinkUnrecognisedSchema
 	}
@@ -696,17 +702,24 @@ func (l *links) handler(linkType linkType, options linkOptions, conn net.Conn, s
 		success()
 	}
 
-	// Register QUIC datagram support for this peer if available.
+	// Register datagram support for this peer if the transport supports it.
 	if lc, ok := conn.(*linkConn); ok {
-		if qs, ok := lc.Conn.(*linkQUICStream); ok {
+		var dgConn DatagramConn
+		// Check if the connection supports datagrams via the DatagramConn interface
+		if dc, ok := lc.Conn.(DatagramConn); ok {
+			dgConn = dc
+		} else if qs, ok := lc.Conn.(*linkQUICStream); ok {
 			qc := qs.Conn
 			if cs := qc.ConnectionState(); cs.SupportsDatagrams.Local && cs.SupportsDatagrams.Remote {
-				var peerKey keyArray
-				copy(peerKey[:], meta.publicKey)
-				l.core.registerDatagramConn(peerKey, qc)
-				defer l.core.unregisterDatagramConn(peerKey)
-				go l.core.datagramReceiver(peerKey, qc)
+				dgConn = qc
 			}
+		}
+		if dgConn != nil {
+			var peerKey keyArray
+			copy(peerKey[:], meta.publicKey)
+			l.core.registerDatagramConn(peerKey, dgConn)
+			defer l.core.unregisterDatagramConn(peerKey)
+			go l.core.datagramReceiver(peerKey, dgConn)
 		}
 	}
 

@@ -232,6 +232,16 @@ func (c *Core) PublicKey() ed25519.PublicKey {
 	return c.public
 }
 
+// WTSCertHash returns the hex-encoded SHA-256 hash of the WebTransport
+// listener's ECDSA certificate. Browsers use this for serverCertificateHashes
+// pinning to accept self-signed certs. Returns "" if WTS is not configured.
+func (c *Core) WTSCertHash() string {
+	if c.links.wt == nil {
+		return ""
+	}
+	return c.links.wt.CertHash()
+}
+
 // AllowPublicKey adds a public key to the AllowedPublicKeys set at runtime.
 // If the set is non-empty, only keys in the set are allowed for incoming peerings.
 func (c *Core) AllowPublicKey(key ed25519.PublicKey) {

@@ -17,6 +17,7 @@ import (
 type NATMapper struct {
 	mu          sync.RWMutex
 	localPort   int
+	webPort     int // WSS/WTS port to also map (0 = skip)
 	mappedPort  int
 	externalIP  net.IP
 	description string
@@ -193,6 +194,14 @@ func (m *NATMapper) mapPortUPnP() error {
 		fmt.Printf("UPnP TCP mapping failed (non-fatal): %v\n", err)
 	}
 	m.mappedPort = int(port)
+
+	// Also map the web port (WSS/WTS) if configured
+	if m.webPort > 0 {
+		wp := uint16(m.webPort)
+		_ = m.upnpClient.AddPortMappingCtx(ctx, "", wp, "UDP", wp, localIP, true, m.description+" WTS", uint32(m.leaseSecs))
+		_ = m.upnpClient.AddPortMappingCtx(ctx, "", wp, "TCP", wp, localIP, true, m.description+" WSS", uint32(m.leaseSecs))
+	}
+
 	return nil
 }
 
@@ -205,6 +214,12 @@ func (m *NATMapper) mapPortPMP() error {
 
 	// Also map TCP on the same port (non-fatal if it fails)
 	_, _ = m.pmpClient.AddPortMapping("tcp", m.localPort, m.localPort, m.leaseSecs)
+
+	// Also map the web port (WSS/WTS) if configured
+	if m.webPort > 0 {
+		_, _ = m.pmpClient.AddPortMapping("udp", m.webPort, m.webPort, m.leaseSecs)
+		_, _ = m.pmpClient.AddPortMapping("tcp", m.webPort, m.webPort, m.leaseSecs)
+	}
 
 	// Get external IP.
 	extResult, err := m.pmpClient.GetExternalAddress()
@@ -226,6 +241,13 @@ func (m *NATMapper) refreshLoop(interval time.Duration) {
 			_ = m.mapPort() // silently refresh
 		}
 	}
+}
+
+// SetWebPort sets the WSS/WTS port to also map via UPnP.
+func (m *NATMapper) SetWebPort(port int) {
+	m.mu.Lock()
+	m.webPort = port
+	m.mu.Unlock()
 }
 
 // ExternalAddr returns the external IP:port if a mapping exists.

@@ -17,7 +17,6 @@ import (
 	iwt "github.com/Arceliar/ironwood/types"
 	"github.com/Arceliar/phony"
 	"github.com/gologme/log"
-	"github.com/quic-go/quic-go"
 
 	"github.com/yggdrasil-network/yggdrasil-go/src/address"
 	"github.com/yggdrasil-network/yggdrasil-go/src/version"
@@ -50,7 +49,7 @@ type Core struct {
 	pathNotify func(ed25519.PublicKey)
 	dgram struct {
 		sync.RWMutex
-		conns   map[keyArray]*quic.Conn
+		conns   map[keyArray]DatagramConn
 		frags   map[keyArray]*dgFragmenter
 		reasm   *dgReassembler
 		recvCh  chan DatagramPacket
@@ -58,6 +57,13 @@ type Core struct {
 }
 
 // DatagramPacket is an unreliable datagram received from a direct QUIC peer.
+// DatagramConn is implemented by connections that support unreliable datagrams.
+// Both *quic.Conn and *webtransport.Session satisfy this interface.
+type DatagramConn interface {
+	SendDatagram([]byte) error
+	ReceiveDatagram(context.Context) ([]byte, error)
+}
+
 type DatagramPacket struct {
 	Data []byte
 	From keyArray
@@ -127,7 +133,7 @@ func New(cert *tls.Certificate, logger Logger, opts ...SetupOption) (*Core, erro
 		return nil, fmt.Errorf("error creating encryption: %w", err)
 	}
 	c.proto.init(c)
-	c.dgram.conns = make(map[keyArray]*quic.Conn)
+	c.dgram.conns = make(map[keyArray]DatagramConn)
 	c.dgram.frags = make(map[keyArray]*dgFragmenter)
 	c.dgram.reasm = newDgReassembler()
 	c.dgram.recvCh = make(chan DatagramPacket, 256)
@@ -260,7 +266,7 @@ func (c *Core) SetPathNotify(notify func(ed25519.PublicKey)) {
 	})
 }
 
-func (c *Core) registerDatagramConn(peerKey keyArray, conn *quic.Conn) {
+func (c *Core) registerDatagramConn(peerKey keyArray, conn DatagramConn) {
 	c.dgram.Lock()
 	c.dgram.conns[peerKey] = conn
 	c.dgram.frags[peerKey] = &dgFragmenter{}
@@ -274,7 +280,7 @@ func (c *Core) unregisterDatagramConn(peerKey keyArray) {
 	c.dgram.Unlock()
 }
 
-func (c *Core) datagramReceiver(peerKey keyArray, conn *quic.Conn) {
+func (c *Core) datagramReceiver(peerKey keyArray, conn DatagramConn) {
 	for {
 		wire, err := conn.ReceiveDatagram(c.ctx)
 		if err != nil {

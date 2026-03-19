@@ -34,6 +34,7 @@ type Multicast struct {
 	_listeners  map[string]*listenerInfo
 	_interfaces map[string]*interfaceInfo
 	_timer      *time.Timer
+	WebPort     uint16 // WSS/WTS port to advertise in beacons (set by libgo)
 	config      struct {
 		_groupAddr  GroupAddress
 		_interfaces map[MulticastInterface]struct{}
@@ -356,6 +357,7 @@ func (m *Multicast) _announce() {
 				MinorVersion: core.ProtocolVersionMinor,
 				PublicKey:    m.core.PublicKey(),
 				Port:         uint16(addr.Port),
+				WebPort:      m.WebPort,
 				Hash:         info.hash,
 			}
 			msg, err := adv.MarshalBinary()
@@ -466,6 +468,9 @@ func (m *Multicast) listen() {
 			if err := m.core.CallPeer(u, from.Zone); err != nil {
 				m.log.Debugln("Call from multicast failed:", err)
 			}
+			// Note: WSS multicast disabled — link-local IPv6 without zone ID
+			// causes connection timeouts that block the links actor.
+			// WSS is for internet/browser clients, not LAN discovery.
 		}
 	}
 }

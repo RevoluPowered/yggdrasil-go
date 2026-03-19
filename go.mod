@@ -6,6 +6,8 @@ replace github.com/Arceliar/ironwood => ./ironwood
 
 replace github.com/quic-go/quic-go => ./quic-go
 
+replace github.com/quic-go/webtransport-go => ./webtransport-go
+
 require (
 	github.com/Arceliar/ironwood v0.0.0-20260117132459-7017dbc41d8e
 	github.com/Arceliar/phony v0.0.0-20220903101357-530938a4b13d
@@ -14,8 +16,11 @@ require (
 	github.com/gologme/log v1.3.0
 	github.com/hashicorp/go-syslog v1.0.0
 	github.com/hjson/hjson-go/v4 v4.5.0
+	github.com/huin/goupnp v1.3.0
+	github.com/jackpal/go-nat-pmp v1.0.2
 	github.com/kardianos/minwinsvc v1.0.2
 	github.com/quic-go/quic-go v0.59.0
+	github.com/quic-go/webtransport-go v0.10.0
 	github.com/vishvananda/netlink v1.3.1
 	github.com/wlynxg/anet v0.0.5
 	golang.org/x/crypto v0.47.0
@@ -32,9 +37,9 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1 // indirect
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.3.0 // indirect
-	github.com/huin/goupnp v1.3.0 // indirect
-	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
+	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/quic-go/qpack v0.6.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
 )
 

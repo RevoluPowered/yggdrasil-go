@@ -49,8 +49,13 @@ type Node struct {
 	Holepunch   *holepunch.HolePunch
 	Listener    *core.Listener
 	TLSListener *core.Listener
-	ListenPort  int
-	Logger      *log.Logger
+	WTSListener *core.Listener
+	WSSListener *core.Listener
+	ListenPort   int
+	WTSPort      int
+	NoMulticast  bool // skip multicast startup
+	NoUPnP       bool // skip UPnP/STUN
+	Logger       *log.Logger
 	RecvCh      chan RecvPacket
 	dgRecvCh    chan RecvPacket
 	recvBuf     []byte
@@ -154,8 +159,16 @@ func SetCrashLog(path string) error {
 
 // --- Lifecycle ---
 
-func Start(configJSON string, logCb LogCallback) (int32, error) {
+type StartOption func(*Node)
+
+func WithNoMulticast() StartOption { return func(n *Node) { n.NoMulticast = true } }
+func WithNoUPnP() StartOption     { return func(n *Node) { n.NoUPnP = true } }
+
+func Start(configJSON string, logCb LogCallback, opts ...StartOption) (int32, error) {
 	node := &Node{}
+	for _, opt := range opts {
+		opt(node)
+	}
 
 	var logger *log.Logger
 	if logCb != nil {
@@ -256,7 +269,9 @@ func Start(configJSON string, logCb LogCallback) (int32, error) {
 				Password: intf.Password,
 			})
 		}
-		node.Multicast, _ = multicast.New(node.Core, node.Logger, mcastOpts...)
+		if !node.NoMulticast {
+			node.Multicast, _ = multicast.New(node.Core, node.Logger, mcastOpts...)
+		}
 	}
 
 	// QUIC listener — try 27000-28000 range
@@ -295,25 +310,92 @@ func Start(configJSON string, logCb LogCallback) (int32, error) {
 		}
 	}
 
-	// Hole punching
-	hp, err := holepunch.New(logger, node.ListenPort)
-	if err != nil {
-		logger.Warnln("Failed to initialize hole punching:", err)
-	} else {
-		node.Holepunch = hp
-		go func() {
-			if result, err := hp.RefreshSTUN(); err != nil {
-				logger.Warnln("STUN discovery failed:", err)
-			} else {
-				logger.Infof("STUN discovered public address: %s", result)
+	// WTS (WebTransport) listener — for browser clients
+	// Try to reuse the last WTS port from config, then scan 27000-28000 range
+	wtsStartPort := node.ListenPort + 1
+	if len(node.Config.Listen) > 0 {
+		for _, l := range node.Config.Listen {
+			if strings.HasPrefix(l, "wts://") {
+				if u, err := url.Parse(l); err == nil {
+					if p, err := strconv.Atoi(u.Port()); err == nil && p > 0 {
+						wtsStartPort = p
+					}
+				}
+				break
 			}
-		}()
+		}
+	}
+	for port := wtsStartPort; port <= 28000; port++ {
+		wtsURI, _ := url.Parse(InjectClientKey(fmt.Sprintf("wts://[::]:%d", port)))
+		wtsListener, err := node.Core.Listen(wtsURI, "")
+		if err == nil {
+			node.WTSListener = wtsListener
+			node.WTSPort = port
+			logger.Infof("WTS listener on %s", wtsListener.Addr())
+			// Persist in config so it's reused on restart
+			found := false
+			for i, l := range node.Config.Listen {
+				if strings.HasPrefix(l, "wts://") {
+					node.Config.Listen[i] = fmt.Sprintf("wts://[::]:%d", port)
+					found = true
+					break
+				}
+			}
+			if !found {
+				node.Config.Listen = append(node.Config.Listen, fmt.Sprintf("wts://[::]:%d", port))
+			}
+			break
+		}
+	}
+
+	// WSS (WebSocket Secure) listener on same port as WTS (TCP vs UDP)
+	if node.WTSPort > 0 {
+		wssURI, _ := url.Parse(InjectClientKey(fmt.Sprintf("wss://[::]:%d", node.WTSPort)))
+		wssListener, err := node.Core.Listen(wssURI, "")
+		if err == nil {
+			node.WSSListener = wssListener
+			logger.Infof("WSS listener on %s", wssListener.Addr())
+		}
+	}
+
+	// Tell multicast to advertise the web port in beacons
+	if node.WTSPort > 0 && node.Multicast != nil {
+		node.Multicast.WebPort = uint16(node.WTSPort)
+	}
+
+	// Hole punching / UPnP / STUN
+	if !node.NoUPnP {
+		hp, err := holepunch.New(logger, node.ListenPort)
+		if err != nil {
+			logger.Warnln("Failed to initialize hole punching:", err)
+		} else {
+			node.Holepunch = hp
+			if node.WTSPort > 0 {
+				hp.SetWebPort(node.WTSPort)
+			}
+			go func() {
+				if result, err := hp.RefreshSTUN(); err != nil {
+					logger.Warnln("STUN discovery failed:", err)
+				} else {
+					logger.Infof("STUN discovered public address: %s", result)
+				}
+			}()
+		}
 	}
 
 	node.RecvCh = make(chan RecvPacket, 256)
 
 	setLastError(nil)
 	return newHandle(node), nil
+}
+
+func StopMulticast(handle int32) {
+	node := GetNode(handle)
+	if node == nil || node.Multicast == nil {
+		return
+	}
+	node.Multicast.Stop()
+	node.Multicast = nil
 }
 
 func Stop(handle int32) error {
@@ -978,6 +1060,63 @@ func GetExternalTLSURI(handle int32) string {
 		return ""
 	}
 	return node.Holepunch.ExternalTLSURI()
+}
+
+func GetExternalWTSURI(handle int32) string {
+	node := GetNode(handle)
+	if node == nil || node.Holepunch == nil || node.WTSPort == 0 {
+		return ""
+	}
+	// Get external IP from the QUIC URI and replace scheme + port
+	quicURI := node.Holepunch.ExternalURI()
+	if quicURI == "" {
+		return ""
+	}
+	parsed, err := url.Parse(quicURI)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("wts://%s", net.JoinHostPort(parsed.Hostname(), fmt.Sprintf("%d", node.WTSPort)))
+}
+
+func GetExternalWSSURI(handle int32) string {
+	node := GetNode(handle)
+	if node == nil || node.Holepunch == nil || node.WTSPort == 0 {
+		return ""
+	}
+	quicURI := node.Holepunch.ExternalURI()
+	if quicURI == "" {
+		return ""
+	}
+	parsed, err := url.Parse(quicURI)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("wss://%s", net.JoinHostPort(parsed.Hostname(), fmt.Sprintf("%d", node.WTSPort)))
+}
+
+func GetWTSCertHash(handle int32) string {
+	node := GetNode(handle)
+	if node == nil {
+		return ""
+	}
+	return node.Core.WTSCertHash()
+}
+
+func GetListenPort(handle int32) int {
+	node := GetNode(handle)
+	if node == nil {
+		return 0
+	}
+	return node.ListenPort
+}
+
+func GetWTSPort(handle int32) int {
+	node := GetNode(handle)
+	if node == nil {
+		return 0
+	}
+	return node.WTSPort
 }
 
 func DetectNAT(handle int32) (string, error) {

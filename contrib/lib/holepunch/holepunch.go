@@ -97,6 +97,15 @@ func (hp *HolePunch) UPnPEnabled() bool {
 	return hp.natMapper != nil
 }
 
+// SetWebPort tells the NAT mapper to also map the WSS/WTS port.
+func (hp *HolePunch) SetWebPort(port int) {
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+	if hp.natMapper != nil {
+		hp.natMapper.SetWebPort(port)
+	}
+}
+
 // ExternalURI returns the UPnP-mapped QUIC URI, or "" if unavailable.
 func (hp *HolePunch) ExternalURI() string {
 	hp.mu.RLock()
